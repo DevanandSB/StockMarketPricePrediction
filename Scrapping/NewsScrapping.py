@@ -1,15 +1,16 @@
-import datetime
-import random
-import re
-import time
-import warnings
-from datetime import timedelta
-
-import feedparser
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+import feedparser
+import datetime
+import time
+import random
 from textblob import TextBlob
+import re
+import json
+from datetime import timedelta
+import xml.etree.ElementTree as ET
+import warnings
 
 warnings.filterwarnings('ignore')
 
@@ -553,7 +554,6 @@ class HybridIndianNewsScraper:
             df = df[df['Date'] >= recent_date]
 
         return df
-
 
 if __name__ == "__main__":
     main()

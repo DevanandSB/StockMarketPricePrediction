@@ -225,7 +225,7 @@ def main():
         print("\n❌ No articles were collected.")
         return
 
-    # Save to CSV
+    # Save to RAW_CSV
     filename = f"indian_stock_market_news_historical_2015_2025.csv"
     df.to_csv(filename, index=False, encoding='utf-8')
 

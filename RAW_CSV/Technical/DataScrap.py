@@ -11,11 +11,11 @@ def get_nifty50_companies():
     url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
 
     try:
-        # Download the CSV file
+        # Download the RAW_CSV file
         response = requests.get(url, timeout=10)
         response.raise_for_status()
 
-        # Read the CSV data
+        # Read the RAW_CSV data
         df = pd.read_csv(pd.compat.StringIO(response.text))
 
         # Extract company symbols (NSE symbols with .NS suffix for yfinance)
@@ -82,7 +82,7 @@ def main():
             data = download_stock_data(symbol, start_date, end_date)
 
             if data is not None:
-                # Save to CSV in current directory
+                # Save to RAW_CSV in current directory
                 filename = f"{symbol}_historical.csv"
                 data.to_csv(filename)
                 success_count += 1

@@ -112,14 +112,13 @@ class TFTLightningWrapper(pl.LightningModule):
             eps=1e-8
         )
 
-        # Learning rate scheduler with careful settings
+        # Learning rate scheduler with careful settings - removed verbose parameter
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
             factor=0.7,  # Gentle reduction
             patience=5,
             min_lr=1e-6,
-            verbose=True
         )
 
         return {
@@ -157,8 +156,8 @@ def main():
     print("TRAINING TFT MODEL FOR STOCK PRICE PREDICTION")
     print("=" * 60)
     print("Target validation loss: 75.0")
-    print("Training on CPU for stability")
-    print("Estimated time: 8-15 hours")
+    print("Training on GPU for faster performance")
+    print("Estimated time: 4-8 hours")
     print("=" * 60)
 
     # 1. SETUP AND DATA LOADING
@@ -254,7 +253,7 @@ def main():
         time_idx="time_idx",
         target="future_close",
         group_ids=["Symbol"],
-        max_encoder_length=45,  # Reduced for memory and stability
+        max_encoder_length=60,  # Increased for better context
         max_prediction_length=7,
         static_categoricals=["Sector"],
         time_varying_known_reals=[],
@@ -268,7 +267,7 @@ def main():
         add_relative_time_idx=True,
         add_target_scales=True,
         allow_missing_timesteps=True,
-        min_encoder_length=10,
+        min_encoder_length=20,
     )
 
     # Create validation dataset
@@ -279,17 +278,17 @@ def main():
     # 6. DATALOADERS
     print("Creating DataLoaders...")
 
-    batch_size = 32  # Reasonable batch size for CPU
-    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
-    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+    batch_size = 64  # Increased batch size for GPU
+    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=4)
+    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=4)
 
     # 7. MODEL SETUP
     tft = TemporalFusionTransformer.from_dataset(
         training,
         learning_rate=0.001,
-        hidden_size=96,  # Balanced size
-        attention_head_size=3,
-        dropout=0.2,  # Regularization
+        hidden_size=128,  # Increased for better capacity
+        attention_head_size=4,
+        dropout=0.3,  # Slightly more regularization
         loss=QuantileLoss(),
         log_interval=100,
         reduce_on_plateau_patience=4,
@@ -301,8 +300,8 @@ def main():
     # 8. CALLBACKS
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
-        min_delta=0.1,  # Reasonable minimum improvement
-        patience=12,  # Patient early stopping
+        min_delta=0.05,  # Smaller minimum improvement
+        patience=15,  # More patient early stopping
         verbose=True,
         mode="min"
     )
@@ -310,7 +309,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         dirpath='checkpoints',
         filename='tft-best-{epoch:03d}-{val_loss:.2f}',
-        save_top_k=2,
+        save_top_k=3,
         monitor='val_loss',
         mode='min',
         every_n_epochs=1,
@@ -329,31 +328,33 @@ def main():
             super().on_train_epoch_start(trainer, pl_module)
             if trainer.current_epoch == 0:
                 print(f"\n🚀 Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("⏰ Estimated training time: 8-15 hours")
+                print("⏰ Estimated training time: 4-8 hours")
                 print("🎯 Target validation loss: 75.0")
-                print("💻 Training on CPU for maximum stability")
+                print("💻 Training on GPU for faster performance")
                 print("📊 Training until validation loss stops improving")
                 print("=" * 60)
 
     progress_bar = DetailedProgressBar()
 
-    # 9. TRAINER SETUP - FORCE CPU FOR STABILITY
+    # 9. TRAINER SETUP - USE GPU FOR FASTER TRAINING
     trainer_args = {
-        'max_epochs': 100,
+        'max_epochs': 200,
         'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
         'enable_progress_bar': True,
-        'num_sanity_val_steps': 0,
+        'num_sanity_val_steps': 2,
         'check_val_every_n_epoch': 1,
-        'gradient_clip_val': 0.3,
-        'accelerator': 'cpu',  # Force CPU for stability
+        'gradient_clip_val': 0.5,
+        'accelerator': 'gpu' if torch.cuda.is_available() else 'cpu',
         'devices': 1,
-        'log_every_n_steps': 50,
+        'log_every_n_steps': 25,
+        'precision': '16-mixed' if torch.cuda.is_available() else '32',  # Mixed precision for GPU
     }
 
     trainer = pl.Trainer(**trainer_args)
 
     # 10. TRAINING
     print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")
+    print(f"Using device: {trainer_args['accelerator']}")
     print("Starting training...")
 
     try:
@@ -402,6 +403,8 @@ def main():
             'training_dataset_parameters': training.get_parameters(),
         }, 'tft_model_error.pt')
         print("🔧 Debug model saved as 'tft_model_error.pt'")
+        import traceback
+        traceback.print_exc()
 
     # 12. FINAL OUTPUT
     training_time = time.time() - start_time

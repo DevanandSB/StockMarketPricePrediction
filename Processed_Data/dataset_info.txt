@@ -1,0 +1,82 @@
+STOCK PREDICTION DATASET - EXTREMELY CAREFUL PREPARATION
+================================================================================
+
+DATASET SIZES:
+Training samples: 86,882
+Validation samples: 18,962
+Test samples: 19,202
+Total samples: 125,046
+
+DATE RANGES:
+Start date: 2015-01-01 00:00:00
+End date: 2025-08-19 00:00:00
+Total days: 2625
+
+SYMBOL INFORMATION:
+Unique symbols: 49
+Top 10 symbols by sample count:
+  UNKNOWN: 5,251 samples
+  ITC: 2,622 samples
+  SBIN: 2,622 samples
+  JSWSTEEL: 2,622 samples
+  KOTAKBANK: 2,622 samples
+  LT: 2,622 samples
+  MARUTI: 2,622 samples
+  NESTLEIND: 2,622 samples
+  NTPC: 2,622 samples
+  ONGC: 2,622 samples
+
+FEATURE INFORMATION:
+Total features: 38
+Feature list:
+ 1. Date
+ 2. Open
+ 3. High
+ 4. Low
+ 5. Close
+ 6. Volume
+ 7. Dividends
+ 8. Stock Splits
+ 9. Symbol
+10. date
+11. MA_5
+12. MA_20
+13. MA_50
+14. price_change
+15. volatility_20
+16. volume_ma_20
+17. volume_ratio
+18. RSI
+19. Date_fund
+20. Market Cap
+21. Current Price
+22. High_fund
+23. Low_fund
+24. Stock P/E
+25. Book Value
+26. Dividend Yield
+27. ROE
+28. EPS
+29. Debt to equity
+30. Price to book value
+31. Sector
+32. Volume_fund
+33. avg_sentiment
+34. news_count
+35. sentiment_std
+36. has_news
+37. future_close
+38. target_return
+
+NEWS DATA INFORMATION:
+News statistics:
+       avg_sentiment     news_count       has_news
+count  125046.000000  125046.000000  125046.000000
+mean        0.401586       3.522216       0.998840
+std         0.297384       1.120476       0.034033
+min        -0.769222       0.000000       0.000000
+25%         0.203740       3.000000       1.000000
+50%         0.420186       4.000000       1.000000
+75%         0.604419       5.000000       1.000000
+max         0.952163       5.000000       1.000000
+Days with news: 124,901/125,046 (99.9%)

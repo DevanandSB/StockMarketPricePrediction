@@ -35,8 +35,14 @@ class TFTLightningWrapper(pl.LightningModule):
         return self.tft(x)
 
     def training_step(self, batch, batch_idx):
-        # Properly handle TFT output format
-        x, y = batch
+        # TimeSeriesDataSet returns (x, y) where y is a tuple (target, weight)
+        x, y_tuple = batch
+        y = y_tuple[0]  # Extract the target from the tuple
+
+        # Ensure data is on the same device as model
+        x = self._move_to_device(x)
+        y = y.to(self.device)
+
         output = self.tft(x)
 
         # TFT returns a tuple (prediction, x) - we need the prediction part
@@ -45,13 +51,24 @@ class TFTLightningWrapper(pl.LightningModule):
         else:
             prediction = output
 
+        # Debug: Check for extreme values
+        if torch.isnan(prediction).any() or torch.isinf(prediction).any():
+            print(f"WARNING: Invalid predictions detected")
+            print(f"Prediction range: {prediction.min().item():.4f} to {prediction.max().item():.4f}")
+
         loss = self.loss_fn(prediction, y)
         self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # Properly handle TFT output format
-        x, y = batch
+        # TimeSeriesDataSet returns (x, y) where y is a tuple (target, weight)
+        x, y_tuple = batch
+        y = y_tuple[0]  # Extract the target from the tuple
+
+        # Ensure data is on the same device as model
+        x = self._move_to_device(x)
+        y = y.to(self.device)
+
         output = self.tft(x)
 
         # TFT returns a tuple (prediction, x) - we need the prediction part
@@ -64,31 +81,55 @@ class TFTLightningWrapper(pl.LightningModule):
         self.log('val_loss', loss, prog_bar=True)
         return loss
 
+    def _move_to_device(self, data):
+        """Move all tensors in the data dictionary to the correct device"""
+        if isinstance(data, dict):
+            return {k: self._move_to_device(v) for k, v in data.items()}
+        elif isinstance(data, torch.Tensor):
+            return data.to(self.device)
+        else:
+            return data
+
     def configure_optimizers(self):
-        # Use a more sophisticated optimizer with weight decay
+        # Use AdamW optimizer with weight decay
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=0.0001,  # Lower learning rate
-            weight_decay=1e-5  # Add weight decay for regularization
+            lr=0.001,  # Reasonable learning rate
+            weight_decay=1e-5,
+            eps=1e-8  # Numerical stability
         )
 
-        # Use a simple step-based scheduler instead of ReduceLROnPlateau
-        scheduler = torch.optim.lr_scheduler.StepLR(
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            step_size=10,  # Reduce LR every 10 epochs
-            gamma=0.5  # Reduce by half
+            mode='min',
+            factor=0.5,
+            patience=3,
+            verbose=True,
+            min_lr=1e-6
         )
 
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'epoch',  # Update after each epoch
+                'monitor': 'val_loss',
+                'interval': 'epoch',
+                'frequency': 1,
             }
         }
 
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         return self.tft.predict(batch)
+
+    def on_train_start(self):
+        """Ensure model is on the correct device at training start"""
+        self.tft = self.tft.to(self.device)
+        print(f"Model moved to device: {self.device}")
+
+    def on_validation_start(self):
+        """Ensure model is on the correct device at validation start"""
+        self.tft = self.tft.to(self.device)
 
 
 def main():
@@ -131,6 +172,14 @@ def main():
     val_df = val_df.reset_index(drop=True)
 
     # 2. ESSENTIAL PREPROCESSING
+    print("Checking data quality...")
+
+    # Check for NaN values and basic statistics
+    print(f"NaN values in train: {train_df.isna().sum().sum()}")
+    print(f"NaN values in val: {val_df.isna().sum().sum()}")
+    print(f"Target stats - Train: mean={train_df['future_close'].mean():.2f}, std={train_df['future_close'].std():.2f}")
+    print(f"Target stats - Val: mean={val_df['future_close'].mean():.2f}, std={val_df['future_close'].std():.2f}")
+
     # Convert Date column to datetime
     train_df['Date'] = pd.to_datetime(train_df['Date'])
     val_df['Date'] = pd.to_datetime(val_df['Date'])
@@ -144,7 +193,6 @@ def main():
     print("Processing categorical variables...")
 
     # Ensure both datasets have the same categories for Symbol and Sector
-    # First, identify all unique categories across both datasets
     all_symbols = pd.concat([train_df['Symbol'], val_df['Symbol']]).unique()
     all_sectors = pd.concat([train_df['Sector'], val_df['Sector']]).unique()
 
@@ -171,7 +219,7 @@ def main():
     # Filter to only include columns that actually exist in the data
     existing_columns = [col for col in time_varying_unknown_reals if col in train_df.columns]
 
-    # Create training dataset with different normalization
+    # Create training dataset
     training = TimeSeriesDataSet(
         train_df,
         time_idx="time_idx",
@@ -185,7 +233,7 @@ def main():
         target_normalizer=GroupNormalizer(
             groups=["Symbol"],
             transformation="softplus",
-            center=False  # Don't center to avoid negative values
+            center=False
         ),
         add_relative_time_idx=True,
         add_target_scales=True,
@@ -215,12 +263,11 @@ def main():
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
         min_delta=1e-4,
-        patience=15,  # Increased patience
+        patience=10,
         verbose=True,
         mode="min"
     )
 
-    # Add model checkpointing
     checkpoint_callback = ModelCheckpoint(
         dirpath='checkpoints',
         filename='tft-best-{epoch:02d}-{val_loss:.2f}',
@@ -243,36 +290,51 @@ def main():
             super().on_train_epoch_start(trainer, pl_module)
             if trainer.current_epoch == 0:
                 print(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("Estimated training time: 5-8 hours (depending on hardware)")
+                print("Estimated training time: 1-3 hours (with GPU), 5-8 hours (CPU only)")
 
     progress_bar = CustomProgressBar()
 
-    # Setup trainer with progress bar - removed gradient_clip_val
-    trainer = pl.Trainer(
-        max_epochs=50,  # Increased max epochs
-        callbacks=[early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
-        enable_progress_bar=True,
-        accelerator='cpu',
-        devices=1,
-        num_sanity_val_steps=1,  # Run validation at start
-        check_val_every_n_epoch=1,  # Check validation every epoch
-    )
+    # 7. TRAINER SETUP - Proper Apple Silicon MPS support
+    trainer_args = {
+        'max_epochs': 50,
+        'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
+        'enable_progress_bar': True,
+        'num_sanity_val_steps': 0,
+        'check_val_every_n_epoch': 1,
+        'gradient_clip_val': 0.1,
+    }
 
-    # Initialize TFT model with better hyperparameters
+    # Proper device detection with Apple Silicon MPS support
+    if torch.backends.mps.is_available():
+        trainer_args['accelerator'] = 'mps'
+        trainer_args['devices'] = 1
+        print("MPS (Apple Silicon) detected - training on MPS GPU")
+    elif torch.cuda.is_available():
+        trainer_args['accelerator'] = 'gpu'
+        trainer_args['devices'] = 1
+        print("CUDA GPU detected - training on GPU")
+    else:
+        trainer_args['accelerator'] = 'cpu'
+        trainer_args['devices'] = 1
+        print("No GPU detected - training on CPU")
+
+    trainer = pl.Trainer(**trainer_args)
+
+    # Initialize TFT model
     tft = TemporalFusionTransformer.from_dataset(
         training,
-        learning_rate=0.0001,  # Lower learning rate
+        learning_rate=0.001,
         hidden_size=128,
         attention_head_size=4,
-        dropout=0.2,  # Increased dropout for regularization
+        dropout=0.1,
         loss=QuantileLoss(),
         log_interval=10,
         reduce_on_plateau_patience=4,
-        output_size=7,  # Explicit output size for 7-day prediction
+        output_size=7,
     )
 
     print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")
-    print("Using learning rate of 0.0001 with AdamW optimizer and StepLR scheduler")
+    print("Using learning rate of 0.001 with AdamW optimizer")
 
     # Wrap the TFT model for compatibility
     lightning_tft = TFTLightningWrapper(tft)
@@ -287,25 +349,45 @@ def main():
             val_dataloaders=val_dataloader,
         )
 
-        # 7. SAVE THE FINAL MODEL
+        # 8. SAVE THE FINAL MODEL
         print("Saving best model...")
 
         # Extract the actual TFT model from the wrapper
         best_tft = lightning_tft.tft
 
-        # Save model using pickle
-        with open('tft_model.pkl', 'wb') as f:
-            pickle.dump(best_tft, f)
+        # Save model using torch.save to avoid pickle issues
+        torch.save({
+            'model_state_dict': best_tft.state_dict(),
+            'training_dataset_parameters': training.get_parameters(),
+            'model_config': {
+                'hidden_size': 128,
+                'attention_head_size': 4,
+                'dropout': 0.1,
+                'output_size': 7,
+            }
+        }, 'tft_model.pt')
+
+        print("Model saved as 'tft_model.pt'")
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user. Saving latest model...")
-        # Save the current model state
         best_tft = lightning_tft.tft
-        with open('tft_model_interrupted.pkl', 'wb') as f:
-            pickle.dump(best_tft, f)
-        print("Model saved as 'tft_model_interrupted.pkl'")
+        torch.save({
+            'model_state_dict': best_tft.state_dict(),
+            'training_dataset_parameters': training.get_parameters(),
+        }, 'tft_model_interrupted.pt')
+        print("Model saved as 'tft_model_interrupted.pt'")
 
-    # 8. PROVIDE CONFIRMATION
+    except Exception as e:
+        print(f"Training failed with error: {str(e)}")
+        print("Saving current model state for debugging...")
+        torch.save({
+            'model_state_dict': lightning_tft.tft.state_dict(),
+            'training_dataset_parameters': training.get_parameters(),
+        }, 'tft_model_error.pt')
+        print("Model saved as 'tft_model_error.pt'")
+
+    # 9. PROVIDE CONFIRMATION
     training_time = time.time() - start_time
     hours, rem = divmod(training_time, 3600)
     minutes, seconds = divmod(rem, 60)

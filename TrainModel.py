@@ -30,12 +30,12 @@ class TFTLightningWrapper(pl.LightningModule):
         super().__init__()
         self.tft = tft_model
         self.loss_fn = QuantileLoss()
+        self.best_val_loss = float('inf')
 
     def forward(self, x):
         return self.tft(x)
 
     def training_step(self, batch, batch_idx):
-        # TimeSeriesDataSet returns (x, y) where y is a tuple (target, weight)
         x, y_tuple = batch
         y = y_tuple[0]  # Extract the target from the tuple
 
@@ -55,13 +55,13 @@ class TFTLightningWrapper(pl.LightningModule):
         if torch.isnan(prediction).any() or torch.isinf(prediction).any():
             print(f"WARNING: Invalid predictions detected")
             print(f"Prediction range: {prediction.min().item():.4f} to {prediction.max().item():.4f}")
+            print(f"Target range: {y.min().item():.4f} to {y.max().item():.4f}")
 
         loss = self.loss_fn(prediction, y)
-        self.log('train_loss', loss, prog_bar=True)
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        # TimeSeriesDataSet returns (x, y) where y is a tuple (target, weight)
         x, y_tuple = batch
         y = y_tuple[0]  # Extract the target from the tuple
 
@@ -78,8 +78,21 @@ class TFTLightningWrapper(pl.LightningModule):
             prediction = output
 
         loss = self.loss_fn(prediction, y)
-        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
+
+    def on_validation_epoch_end(self):
+        # Track best validation loss
+        current_val_loss = self.trainer.callback_metrics.get('val_loss')
+        if current_val_loss is not None:
+            current_val_loss = current_val_loss.item()
+            if current_val_loss < self.best_val_loss:
+                self.best_val_loss = current_val_loss
+                print(f"🎉 New best validation loss: {current_val_loss:.4f}")
+
+                # Check if we reached the target
+                if current_val_loss <= 75.0:
+                    print("🎯 TARGET ACHIEVED: Validation loss <= 75.0!")
 
     def _move_to_device(self, data):
         """Move all tensors in the data dictionary to the correct device"""
@@ -91,22 +104,22 @@ class TFTLightningWrapper(pl.LightningModule):
             return data
 
     def configure_optimizers(self):
-        # Use AdamW optimizer with weight decay
-        optimizer = torch.optim.AdamW(
+        # Use Adam optimizer with careful learning rate
+        optimizer = torch.optim.Adam(
             self.parameters(),
-            lr=0.001,  # Reasonable learning rate
-            weight_decay=1e-5,
-            eps=1e-8  # Numerical stability
+            lr=0.001,  # Conservative learning rate
+            weight_decay=1e-6,
+            eps=1e-8
         )
 
-        # Learning rate scheduler
+        # Learning rate scheduler with careful settings
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
-            factor=0.5,
-            patience=3,
-            verbose=True,
-            min_lr=1e-6
+            factor=0.7,  # Gentle reduction
+            patience=5,
+            min_lr=1e-6,
+            verbose=True
         )
 
         return {
@@ -140,6 +153,14 @@ def main():
     # Create checkpoint directory
     os.makedirs('checkpoints', exist_ok=True)
 
+    print("=" * 60)
+    print("TRAINING TFT MODEL FOR STOCK PRICE PREDICTION")
+    print("=" * 60)
+    print("Target validation loss: 75.0")
+    print("Training on CPU for stability")
+    print("Estimated time: 8-15 hours")
+    print("=" * 60)
+
     # 1. SETUP AND DATA LOADING
     print("Loading and preprocessing data...")
 
@@ -155,15 +176,37 @@ def main():
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
 
+    # 2. CHECK DATA QUALITY AND TIME CONSISTENCY
+    print("Checking data quality and time consistency...")
+
+    print(f"NaN values in train: {train_df.isna().sum().sum()}")
+    print(f"NaN values in val: {val_df.isna().sum().sum()}")
+
+    # Convert Date column to datetime
+    train_df['Date'] = pd.to_datetime(train_df['Date'])
+    val_df['Date'] = pd.to_datetime(val_df['Date'])
+
+    # Check time ranges
+    print(f"Train date range: {train_df['Date'].min()} to {train_df['Date'].max()}")
+    print(f"Validation date range: {val_df['Date'].min()} to {val_df['Date'].max()}")
+
+    # Create consistent time index across both datasets
+    min_date = min(train_df['Date'].min(), val_df['Date'].min())
+    train_df['time_idx'] = (train_df['Date'] - min_date).dt.days
+    val_df['time_idx'] = (val_df['Date'] - min_date).dt.days
+
+    print(f"Train time_idx range: {train_df['time_idx'].min()} to {train_df['time_idx'].max()}")
+    print(f"Validation time_idx range: {val_df['time_idx'].min()} to {val_df['time_idx'].max()}")
+
+    # 3. FILTER DATA PROPERLY
     # Filter validation data to only include symbols present in training data
     valid_symbols = set(train_df['Symbol'].unique())
     val_df = val_df[val_df['Symbol'].isin(valid_symbols)]
 
-    # Also filter training and validation data to only include sectors present in both datasets
+    # Filter sectors
     train_sectors = set(train_df['Sector'].unique())
     val_sectors = set(val_df['Sector'].unique())
     valid_sectors = train_sectors.intersection(val_sectors)
-
     train_df = train_df[train_df['Sector'].isin(valid_sectors)]
     val_df = val_df[val_df['Sector'].isin(valid_sectors)]
 
@@ -171,107 +214,103 @@ def main():
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
 
-    # 2. ESSENTIAL PREPROCESSING
-    print("Checking data quality...")
+    print(f"Train samples after filtering: {len(train_df):,}")
+    print(f"Validation samples after filtering: {len(val_df):,}")
 
-    # Check for NaN values and basic statistics
-    print(f"NaN values in train: {train_df.isna().sum().sum()}")
-    print(f"NaN values in val: {val_df.isna().sum().sum()}")
+    # Check target statistics after filtering
     print(f"Target stats - Train: mean={train_df['future_close'].mean():.2f}, std={train_df['future_close'].std():.2f}")
     print(f"Target stats - Val: mean={val_df['future_close'].mean():.2f}, std={val_df['future_close'].std():.2f}")
 
-    # Convert Date column to datetime
-    train_df['Date'] = pd.to_datetime(train_df['Date'])
-    val_df['Date'] = pd.to_datetime(val_df['Date'])
+    mean_diff = abs(train_df['future_close'].mean() - val_df['future_close'].mean())
+    if mean_diff > 500:
+        print(f"⚠️  WARNING: Large difference between train and validation target means: {mean_diff:.2f}")
+        print("This suggests different market conditions or data leakage")
 
-    # Create consistent time index across both datasets
-    min_date = min(train_df['Date'].min(), val_df['Date'].min())
-    train_df['time_idx'] = (train_df['Date'] - min_date).dt.days
-    val_df['time_idx'] = (val_df['Date'] - min_date).dt.days
-
-    # 3. HANDLE CATEGORICAL VARIABLES ROBUSTLY
+    # 4. CATEGORICAL VARIABLES
     print("Processing categorical variables...")
 
-    # Ensure both datasets have the same categories for Symbol and Sector
     all_symbols = pd.concat([train_df['Symbol'], val_df['Symbol']]).unique()
     all_sectors = pd.concat([train_df['Sector'], val_df['Sector']]).unique()
 
-    # Convert to categorical with all possible categories
     train_df['Symbol'] = pd.Categorical(train_df['Symbol'], categories=all_symbols)
     val_df['Symbol'] = pd.Categorical(val_df['Symbol'], categories=all_symbols)
-
     train_df['Sector'] = pd.Categorical(train_df['Sector'], categories=all_sectors)
     val_df['Sector'] = pd.Categorical(val_df['Sector'], categories=all_sectors)
 
-    # 4. TIMESERIESDATASET CONFIGURATION
+    # 5. TIMESERIESDATASET CONFIGURATION
     print("Creating TimeSeriesDataSet objects...")
 
-    # Define time-varying unknown real features
-    time_varying_unknown_reals = [
+    # Use essential features only for stability
+    basic_features = [
         "Open", "High", "Low", "Close", "Volume", "MA_5", "MA_20", "MA_50",
-        "price_change", "volatility_20", "volume_ma_20", "volume_ratio", "RSI",
-        "Market Cap", "Current Price", "High_fund", "Low_fund", "Stock P/E",
-        "Book Value", "Dividend Yield", "ROE", "EPS", "Debt to equity",
-        "Price to book value", "Volume_fund", "avg_sentiment", "news_count",
-        "sentiment_std", "has_news"
+        "price_change", "volatility_20", "RSI", "volume_ma_20"
     ]
 
-    # Filter to only include columns that actually exist in the data
-    existing_columns = [col for col in time_varying_unknown_reals if col in train_df.columns]
+    existing_columns = [col for col in basic_features if col in train_df.columns]
 
-    # Create training dataset
+    # Create training dataset with safe settings
     training = TimeSeriesDataSet(
         train_df,
         time_idx="time_idx",
         target="future_close",
         group_ids=["Symbol"],
-        max_encoder_length=60,
+        max_encoder_length=45,  # Reduced for memory and stability
         max_prediction_length=7,
         static_categoricals=["Sector"],
-        time_varying_known_reals=[],  # No known future features
+        time_varying_known_reals=[],
         time_varying_unknown_reals=existing_columns,
         target_normalizer=GroupNormalizer(
             groups=["Symbol"],
             transformation="softplus",
-            center=False
+            center=True,
+            scale_by_group=True
         ),
         add_relative_time_idx=True,
         add_target_scales=True,
         allow_missing_timesteps=True,
+        min_encoder_length=10,
     )
 
-    # Create validation dataset with same parameters
+    # Create validation dataset
     validation = TimeSeriesDataSet.from_dataset(
-        training, val_df, predict=True, stop_randomization=True
+        training, val_df, predict=False, stop_randomization=True
     )
 
-    # 5. CREATE PYTORCH DATALOADERS
+    # 6. DATALOADERS
     print("Creating DataLoaders...")
 
-    batch_size = 32
-    train_dataloader = training.to_dataloader(
-        train=True, batch_size=batch_size, num_workers=0
-    )
-    val_dataloader = validation.to_dataloader(
-        train=False, batch_size=batch_size, num_workers=0
+    batch_size = 32  # Reasonable batch size for CPU
+    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
+    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
+
+    # 7. MODEL SETUP
+    tft = TemporalFusionTransformer.from_dataset(
+        training,
+        learning_rate=0.001,
+        hidden_size=96,  # Balanced size
+        attention_head_size=3,
+        dropout=0.2,  # Regularization
+        loss=QuantileLoss(),
+        log_interval=100,
+        reduce_on_plateau_patience=4,
+        output_size=7,
     )
 
-    # 6. MODEL TRAINING AND OPTIMIZATION
-    print("Setting up model and trainer...")
+    lightning_tft = TFTLightningWrapper(tft)
 
-    # Configure callbacks
+    # 8. CALLBACKS
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
-        min_delta=1e-4,
-        patience=10,
+        min_delta=0.1,  # Reasonable minimum improvement
+        patience=12,  # Patient early stopping
         verbose=True,
         mode="min"
     )
 
     checkpoint_callback = ModelCheckpoint(
         dirpath='checkpoints',
-        filename='tft-best-{epoch:02d}-{val_loss:.2f}',
-        save_top_k=3,
+        filename='tft-best-{epoch:03d}-{val_loss:.2f}',
+        save_top_k=2,
         monitor='val_loss',
         mode='min',
         every_n_epochs=1,
@@ -280,8 +319,8 @@ def main():
 
     lr_logger = LearningRateMonitor()
 
-    # Create a custom progress bar with time estimation
-    class CustomProgressBar(TQDMProgressBar):
+    # Custom progress bar with detailed information
+    class DetailedProgressBar(TQDMProgressBar):
         def __init__(self):
             super().__init__()
             self.enable = True
@@ -289,57 +328,32 @@ def main():
         def on_train_epoch_start(self, trainer, pl_module):
             super().on_train_epoch_start(trainer, pl_module)
             if trainer.current_epoch == 0:
-                print(f"Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("Estimated training time: 1-3 hours (with GPU), 5-8 hours (CPU only)")
+                print(f"\n🚀 Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                print("⏰ Estimated training time: 8-15 hours")
+                print("🎯 Target validation loss: 75.0")
+                print("💻 Training on CPU for maximum stability")
+                print("📊 Training until validation loss stops improving")
+                print("=" * 60)
 
-    progress_bar = CustomProgressBar()
+    progress_bar = DetailedProgressBar()
 
-    # 7. TRAINER SETUP - Proper Apple Silicon MPS support
+    # 9. TRAINER SETUP - FORCE CPU FOR STABILITY
     trainer_args = {
-        'max_epochs': 50,
+        'max_epochs': 100,
         'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
         'enable_progress_bar': True,
         'num_sanity_val_steps': 0,
         'check_val_every_n_epoch': 1,
-        'gradient_clip_val': 0.1,
+        'gradient_clip_val': 0.3,
+        'accelerator': 'cpu',  # Force CPU for stability
+        'devices': 1,
+        'log_every_n_steps': 50,
     }
-
-    # Proper device detection with Apple Silicon MPS support
-    if torch.backends.mps.is_available():
-        trainer_args['accelerator'] = 'mps'
-        trainer_args['devices'] = 1
-        print("MPS (Apple Silicon) detected - training on MPS GPU")
-    elif torch.cuda.is_available():
-        trainer_args['accelerator'] = 'gpu'
-        trainer_args['devices'] = 1
-        print("CUDA GPU detected - training on GPU")
-    else:
-        trainer_args['accelerator'] = 'cpu'
-        trainer_args['devices'] = 1
-        print("No GPU detected - training on CPU")
 
     trainer = pl.Trainer(**trainer_args)
 
-    # Initialize TFT model
-    tft = TemporalFusionTransformer.from_dataset(
-        training,
-        learning_rate=0.001,
-        hidden_size=128,
-        attention_head_size=4,
-        dropout=0.1,
-        loss=QuantileLoss(),
-        log_interval=10,
-        reduce_on_plateau_patience=4,
-        output_size=7,
-    )
-
+    # 10. TRAINING
     print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")
-    print("Using learning rate of 0.001 with AdamW optimizer")
-
-    # Wrap the TFT model for compatibility
-    lightning_tft = TFTLightningWrapper(tft)
-
-    # Train the model
     print("Starting training...")
 
     try:
@@ -349,56 +363,66 @@ def main():
             val_dataloaders=val_dataloader,
         )
 
-        # 8. SAVE THE FINAL MODEL
+        # 11. SAVE FINAL MODEL
         print("Saving best model...")
 
-        # Extract the actual TFT model from the wrapper
-        best_tft = lightning_tft.tft
+        # Load the best model from checkpoint
+        best_model_path = trainer.checkpoint_callback.best_model_path
+        if best_model_path:
+            best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
+        else:
+            best_tft = lightning_tft.tft
 
-        # Save model using torch.save to avoid pickle issues
+        # Save model using torch.save
         torch.save({
             'model_state_dict': best_tft.state_dict(),
             'training_dataset_parameters': training.get_parameters(),
-            'model_config': {
-                'hidden_size': 128,
-                'attention_head_size': 4,
-                'dropout': 0.1,
-                'output_size': 7,
-            }
+            'best_val_loss': lightning_tft.best_val_loss,
         }, 'tft_model.pt')
 
-        print("Model saved as 'tft_model.pt'")
+        print(f"✅ Model saved as 'tft_model.pt'")
+        print(f"🏆 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user. Saving latest model...")
+        print("\n⏹️  Training interrupted by user. Saving current model...")
         best_tft = lightning_tft.tft
         torch.save({
             'model_state_dict': best_tft.state_dict(),
             'training_dataset_parameters': training.get_parameters(),
+            'best_val_loss': lightning_tft.best_val_loss,
         }, 'tft_model_interrupted.pt')
-        print("Model saved as 'tft_model_interrupted.pt'")
+        print(f"💾 Model saved as 'tft_model_interrupted.pt'")
+        print(f"📈 Best validation loss so far: {lightning_tft.best_val_loss:.4f}")
 
     except Exception as e:
-        print(f"Training failed with error: {str(e)}")
-        print("Saving current model state for debugging...")
+        print(f"❌ Training failed with error: {str(e)}")
+        print("💾 Saving current model state for debugging...")
         torch.save({
             'model_state_dict': lightning_tft.tft.state_dict(),
             'training_dataset_parameters': training.get_parameters(),
         }, 'tft_model_error.pt')
-        print("Model saved as 'tft_model_error.pt'")
+        print("🔧 Debug model saved as 'tft_model_error.pt'")
 
-    # 9. PROVIDE CONFIRMATION
+    # 12. FINAL OUTPUT
     training_time = time.time() - start_time
     hours, rem = divmod(training_time, 3600)
     minutes, seconds = divmod(rem, 60)
 
-    print("Training complete.")
-    print(f"Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+    print("=" * 60)
+    print("🏁 TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"⏱️  Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
 
-    # Print final validation loss for reference
     if hasattr(trainer, 'callback_metrics') and 'val_loss' in trainer.callback_metrics:
-        val_loss = trainer.callback_metrics['val_loss'].item()
-        print(f"Final validation loss: {val_loss:.4f}")
+        final_val_loss = trainer.callback_metrics['val_loss'].item()
+        print(f"📊 Final validation loss: {final_val_loss:.4f}")
+
+        if final_val_loss <= 75.0:
+            print("🎯 TARGET ACHIEVED! Validation loss <= 75.0")
+        else:
+            print(f"📉 Target not reached. Best was: {lightning_tft.best_val_loss:.4f}")
+
+    print("=" * 60)
 
 
 if __name__ == "__main__":

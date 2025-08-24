@@ -20,6 +20,8 @@ import pickle
 import time
 import warnings
 import os
+import signal
+import sys
 
 warnings.filterwarnings('ignore')
 
@@ -31,11 +33,17 @@ class TFTLightningWrapper(pl.LightningModule):
         self.tft = tft_model
         self.loss_fn = QuantileLoss()
         self.best_val_loss = float('inf')
+        self.best_model_state = None
+        self.interrupted = False
 
     def forward(self, x):
         return self.tft(x)
 
     def training_step(self, batch, batch_idx):
+        # Check for interruption at each training step
+        if self.interrupted:
+            raise KeyboardInterrupt("Training interrupted by user")
+
         x, y_tuple = batch
         y = y_tuple[0]  # Extract the target from the tuple
 
@@ -82,12 +90,14 @@ class TFTLightningWrapper(pl.LightningModule):
         return loss
 
     def on_validation_epoch_end(self):
-        # Track best validation loss
+        # Track best validation loss and save best model state
         current_val_loss = self.trainer.callback_metrics.get('val_loss')
         if current_val_loss is not None:
             current_val_loss = current_val_loss.item()
             if current_val_loss < self.best_val_loss:
                 self.best_val_loss = current_val_loss
+                # Save the best model state
+                self.best_model_state = {k: v.cpu().clone() for k, v in self.tft.state_dict().items()}
                 print(f"🎉 New best validation loss: {current_val_loss:.4f}")
 
                 # Check if we reached the target
@@ -112,7 +122,7 @@ class TFTLightningWrapper(pl.LightningModule):
             eps=1e-8
         )
 
-        # Learning rate scheduler with careful settings - removed verbose parameter
+        # Learning rate scheduler with careful settings
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='min',
@@ -143,9 +153,26 @@ class TFTLightningWrapper(pl.LightningModule):
         """Ensure model is on the correct device at validation start"""
         self.tft = self.tft.to(self.device)
 
+    def on_train_end(self):
+        """Save best model when training ends"""
+        if self.best_model_state is not None:
+            # Restore best model weights
+            self.tft.load_state_dict(self.best_model_state)
+            print(f"Restored best model with validation loss: {self.best_val_loss:.4f}")
+
+
+def signal_handler(signal, frame):
+    """Handle interrupt signal gracefully"""
+    print("\n⏹️  Training interrupted by user. Saving best model...")
+    # This will be handled by the exception handling in the training loop
+    raise KeyboardInterrupt("Training interrupted by user")
+
 
 def main():
     """Main function to execute the TFT model training pipeline."""
+
+    # Set up signal handler for graceful interruption
+    signal.signal(signal.SIGINT, signal_handler)
 
     start_time = time.time()
 
@@ -385,15 +412,22 @@ def main():
         print(f"🏆 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
 
     except KeyboardInterrupt:
-        print("\n⏹️  Training interrupted by user. Saving current model...")
-        best_tft = lightning_tft.tft
+        print("\n⏹️  Training interrupted by user. Saving best model...")
+
+        # Restore the best model state if available
+        if hasattr(lightning_tft, 'best_model_state') and lightning_tft.best_model_state is not None:
+            lightning_tft.tft.load_state_dict(lightning_tft.best_model_state)
+            print(f"Restored best model with validation loss: {lightning_tft.best_val_loss:.4f}")
+
+        # Save the best model
         torch.save({
-            'model_state_dict': best_tft.state_dict(),
+            'model_state_dict': lightning_tft.tft.state_dict(),
             'training_dataset_parameters': training.get_parameters(),
             'best_val_loss': lightning_tft.best_val_loss,
         }, 'tft_model_interrupted.pt')
-        print(f"💾 Model saved as 'tft_model_interrupted.pt'")
-        print(f"📈 Best validation loss so far: {lightning_tft.best_val_loss:.4f}")
+
+        print(f"💾 Best model saved as 'tft_model_interrupted.pt'")
+        print(f"📈 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
 
     except Exception as e:
         print(f"❌ Training failed with error: {str(e)}")
@@ -416,11 +450,10 @@ def main():
     print("=" * 60)
     print(f"⏱️  Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
 
-    if hasattr(trainer, 'callback_metrics') and 'val_loss' in trainer.callback_metrics:
-        final_val_loss = trainer.callback_metrics['val_loss'].item()
-        print(f"📊 Final validation loss: {final_val_loss:.4f}")
+    if hasattr(lightning_tft, 'best_val_loss'):
+        print(f"📊 Best validation loss: {lightning_tft.best_val_loss:.4f}")
 
-        if final_val_loss <= 75.0:
+        if lightning_tft.best_val_loss <= 75.0:
             print("🎯 TARGET ACHIEVED! Validation loss <= 75.0")
         else:
             print(f"📉 Target not reached. Best was: {lightning_tft.best_val_loss:.4f}")

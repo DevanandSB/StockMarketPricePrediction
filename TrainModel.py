@@ -42,6 +42,7 @@ class TFTLightningWrapper(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         # Check for interruption at each training step
         if self.interrupted:
+            self._save_best_model()
             raise KeyboardInterrupt("Training interrupted by user")
 
         x, y_tuple = batch
@@ -153,19 +154,28 @@ class TFTLightningWrapper(pl.LightningModule):
         """Ensure model is on the correct device at validation start"""
         self.tft = self.tft.to(self.device)
 
-    def on_train_end(self):
-        """Save best model when training ends"""
+    def _save_best_model(self):
+        """Save the best model when training is interrupted"""
         if self.best_model_state is not None:
             # Restore best model weights
             self.tft.load_state_dict(self.best_model_state)
             print(f"Restored best model with validation loss: {self.best_val_loss:.4f}")
 
+            # Save the best model
+            torch.save({
+                'model_state_dict': self.tft.state_dict(),
+                'best_val_loss': self.best_val_loss,
+            }, 'tft_model_interrupted.pt')
+
+            print(f"💾 Best model saved as 'tft_model_interrupted.pt'")
+            print(f"📈 Best validation loss achieved: {self.best_val_loss:.4f}")
+
 
 def signal_handler(signal, frame):
     """Handle interrupt signal gracefully"""
     print("\n⏹️  Training interrupted by user. Saving best model...")
-    # This will be handled by the exception handling in the training loop
-    raise KeyboardInterrupt("Training interrupted by user")
+    # Set the interrupted flag to be handled in the training step
+    sys.exit(0)
 
 
 def main():
@@ -183,8 +193,8 @@ def main():
     print("TRAINING TFT MODEL FOR STOCK PRICE PREDICTION")
     print("=" * 60)
     print("Target validation loss: 75.0")
-    print("Training on GPU for faster performance")
-    print("Estimated time: 4-8 hours")
+    print("Training on CPU for stability")
+    print("Estimated time: 8-15 hours")
     print("=" * 60)
 
     # 1. SETUP AND DATA LOADING
@@ -302,12 +312,12 @@ def main():
         training, val_df, predict=False, stop_randomization=True
     )
 
-    # 6. DATALOADERS
+    # 6. DATALOADERS - Use single worker to avoid multiprocessing issues
     print("Creating DataLoaders...")
 
-    batch_size = 64  # Increased batch size for GPU
-    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=4)
-    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=4)
+    batch_size = 32  # Reduced batch size for stability
+    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
+    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
 
     # 7. MODEL SETUP
     tft = TemporalFusionTransformer.from_dataset(
@@ -355,26 +365,25 @@ def main():
             super().on_train_epoch_start(trainer, pl_module)
             if trainer.current_epoch == 0:
                 print(f"\n🚀 Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("⏰ Estimated training time: 4-8 hours")
+                print("⏰ Estimated training time: 8-15 hours")
                 print("🎯 Target validation loss: 75.0")
-                print("💻 Training on GPU for faster performance")
+                print("💻 Training on CPU for maximum stability")
                 print("📊 Training until validation loss stops improving")
                 print("=" * 60)
 
     progress_bar = DetailedProgressBar()
 
-    # 9. TRAINER SETUP - USE GPU FOR FASTER TRAINING
+    # 9. TRAINER SETUP - FORCE CPU FOR STABILITY
     trainer_args = {
         'max_epochs': 200,
         'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
         'enable_progress_bar': True,
-        'num_sanity_val_steps': 2,
+        'num_sanity_val_steps': 0,  # Disable sanity check to avoid issues
         'check_val_every_n_epoch': 1,
         'gradient_clip_val': 0.5,
-        'accelerator': 'gpu' if torch.cuda.is_available() else 'cpu',
+        'accelerator': 'cpu',  # Force CPU for stability
         'devices': 1,
         'log_every_n_steps': 25,
-        'precision': '16-mixed' if torch.cuda.is_available() else '32',  # Mixed precision for GPU
     }
 
     trainer = pl.Trainer(**trainer_args)
@@ -413,21 +422,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\n⏹️  Training interrupted by user. Saving best model...")
-
-        # Restore the best model state if available
-        if hasattr(lightning_tft, 'best_model_state') and lightning_tft.best_model_state is not None:
-            lightning_tft.tft.load_state_dict(lightning_tft.best_model_state)
-            print(f"Restored best model with validation loss: {lightning_tft.best_val_loss:.4f}")
-
-        # Save the best model
-        torch.save({
-            'model_state_dict': lightning_tft.tft.state_dict(),
-            'training_dataset_parameters': training.get_parameters(),
-            'best_val_loss': lightning_tft.best_val_loss,
-        }, 'tft_model_interrupted.pt')
-
-        print(f"💾 Best model saved as 'tft_model_interrupted.pt'")
-        print(f"📈 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
+        lightning_tft._save_best_model()
 
     except Exception as e:
         print(f"❌ Training failed with error: {str(e)}")

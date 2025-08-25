@@ -1,137 +1,119 @@
 #!/usr/bin/env python3
 """
-TrainModel.py - Temporal Fusion Transformer for Stock Price Prediction
+TrainModel.py - Transformer for Stock Price Prediction with M1 GPU Support
 
-This script trains a TFT model to predict future closing prices of multiple stocks.
-The model is trained on historical financial data with technical indicators and fundamental metrics.
+This script trains a Transformer model to predict future closing prices of multiple stocks.
+Optimized for Apple M1 GPU acceleration.
 
-Author: Data Scientist
-Date: 2024
+Author: Devanand S B
+Date: 2025
 """
 
 import pandas as pd
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, TQDMProgressBar, ModelCheckpoint
-from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-from pytorch_forecasting.data import GroupNormalizer
-from pytorch_forecasting.metrics import QuantileLoss
 import pickle
 import time
 import warnings
 import os
 import signal
 import sys
+from pathlib import Path
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import StandardScaler
+import math
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 warnings.filterwarnings('ignore')
 
+# Set device for M1 GPU acceleration
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print(f"✅ Using Apple M1 GPU (Metal)")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"✅ Using CUDA GPU")
+else:
+    device = torch.device("cpu")
+    print(f"⚠️  Using CPU (no GPU available)")
 
-# Create a wrapper class to make TFT compatible with PyTorch Lightning
-class TFTLightningWrapper(pl.LightningModule):
-    def __init__(self, tft_model):
+
+# Custom Transformer Model
+class StockTransformer(pl.LightningModule):
+    def __init__(self, input_dim, hidden_dim=256, num_layers=4, num_heads=8, dropout=0.1, learning_rate=0.001):
         super().__init__()
-        self.tft = tft_model
-        self.loss_fn = QuantileLoss()
-        self.best_val_loss = float('inf')
-        self.best_model_state = None
-        self.interrupted = False
+        self.save_hyperparameters()
 
-    def forward(self, x):
-        return self.tft(x)
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.learning_rate = learning_rate
+
+        # Input projection
+        self.input_projection = nn.Linear(input_dim, hidden_dim)
+
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
+
+        # Transformer layers
+        encoder_layers = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            activation='gelu'  # Better for MPS
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+
+        # Output layers - predict only 1 value (next day's close)
+        self.output_projection = nn.Linear(hidden_dim, 64)
+        self.output_layer = nn.Linear(64, 1)
+
+        self.loss_fn = nn.MSELoss()
+        self.best_val_loss = float('inf')
+
+    def forward(self, x, mask=None):
+        # x shape: [batch_size, seq_len, input_dim]
+        x = self.input_projection(x)
+        x = self.pos_encoder(x)
+
+        # Transformer expects [seq_len, batch_size, dim] for mask, but we use batch_first=True
+        if mask is not None:
+            mask = mask.transpose(0, 1)  # Convert to [seq_len, seq_len]
+
+        x = self.transformer_encoder(x, mask=mask)
+
+        # Use the last time step's output for prediction
+        x = x[:, -1, :]  # Take the last time step
+
+        x = torch.nn.functional.gelu(self.output_projection(x))
+        x = self.output_layer(x)
+        return x
 
     def training_step(self, batch, batch_idx):
-        # Check for interruption at each training step
-        if self.interrupted:
-            self._save_best_model()
-            raise KeyboardInterrupt("Training interrupted by user")
-
-        x, y_tuple = batch
-        y = y_tuple[0]  # Extract the target from the tuple
-
-        # Ensure data is on the same device as model
-        x = self._move_to_device(x)
-        y = y.to(self.device)
-
-        output = self.tft(x)
-
-        # TFT returns a tuple (prediction, x) - we need the prediction part
-        if isinstance(output, tuple):
-            prediction = output[0]
-        else:
-            prediction = output
-
-        # Debug: Check for extreme values
-        if torch.isnan(prediction).any() or torch.isinf(prediction).any():
-            print(f"WARNING: Invalid predictions detected")
-            print(f"Prediction range: {prediction.min().item():.4f} to {prediction.max().item():.4f}")
-            print(f"Target range: {y.min().item():.4f} to {y.max().item():.4f}")
-
-        loss = self.loss_fn(prediction, y)
-        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+        x, y = batch
+        predictions = self(x)
+        loss = self.loss_fn(predictions, y)
+        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y_tuple = batch
-        y = y_tuple[0]  # Extract the target from the tuple
-
-        # Ensure data is on the same device as model
-        x = self._move_to_device(x)
-        y = y.to(self.device)
-
-        output = self.tft(x)
-
-        # TFT returns a tuple (prediction, x) - we need the prediction part
-        if isinstance(output, tuple):
-            prediction = output[0]
-        else:
-            prediction = output
-
-        loss = self.loss_fn(prediction, y)
-        self.log('val_loss', loss, prog_bar=True, on_step=False, on_epoch=True)
+        x, y = batch
+        predictions = self(x)
+        loss = self.loss_fn(predictions, y)
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('val_rmse', torch.sqrt(loss), prog_bar=True, sync_dist=True)
         return loss
 
-    def on_validation_epoch_end(self):
-        # Track best validation loss and save best model state
-        current_val_loss = self.trainer.callback_metrics.get('val_loss')
-        if current_val_loss is not None:
-            current_val_loss = current_val_loss.item()
-            if current_val_loss < self.best_val_loss:
-                self.best_val_loss = current_val_loss
-                # Save the best model state
-                self.best_model_state = {k: v.cpu().clone() for k, v in self.tft.state_dict().items()}
-                print(f"🎉 New best validation loss: {current_val_loss:.4f}")
-
-                # Check if we reached the target
-                if current_val_loss <= 75.0:
-                    print("🎯 TARGET ACHIEVED: Validation loss <= 75.0!")
-
-    def _move_to_device(self, data):
-        """Move all tensors in the data dictionary to the correct device"""
-        if isinstance(data, dict):
-            return {k: self._move_to_device(v) for k, v in data.items()}
-        elif isinstance(data, torch.Tensor):
-            return data.to(self.device)
-        else:
-            return data
-
     def configure_optimizers(self):
-        # Use Adam optimizer with careful learning rate
-        optimizer = torch.optim.Adam(
-            self.parameters(),
-            lr=0.001,  # Conservative learning rate
-            weight_decay=1e-6,
-            eps=1e-8
+        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
         )
-
-        # Learning rate scheduler with careful settings
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode='min',
-            factor=0.7,  # Gentle reduction
-            patience=5,
-            min_lr=1e-6,
-        )
-
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
@@ -142,316 +124,316 @@ class TFTLightningWrapper(pl.LightningModule):
             }
         }
 
-    def predict_step(self, batch, batch_idx, dataloader_idx=0):
-        return self.tft.predict(batch)
 
-    def on_train_start(self):
-        """Ensure model is on the correct device at training start"""
-        self.tft = self.tft.to(self.device)
-        print(f"Model moved to device: {self.device}")
+# Positional Encoding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-    def on_validation_start(self):
-        """Ensure model is on the correct device at validation start"""
-        self.tft = self.tft.to(self.device)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
-    def _save_best_model(self):
-        """Save the best model when training is interrupted"""
-        if self.best_model_state is not None:
-            # Restore best model weights
-            self.tft.load_state_dict(self.best_model_state)
-            print(f"Restored best model with validation loss: {self.best_val_loss:.4f}")
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
 
-            # Save the best model
-            torch.save({
-                'model_state_dict': self.tft.state_dict(),
-                'best_val_loss': self.best_val_loss,
-            }, 'tft_model_interrupted.pt')
 
-            print(f"💾 Best model saved as 'tft_model_interrupted.pt'")
-            print(f"📈 Best validation loss achieved: {self.best_val_loss:.4f}")
+# Custom Dataset - Optimized for GPU
+class StockDataset(Dataset):
+    def __init__(self, df, sequence_length=60, prediction_horizon=1, feature_columns=None):
+        self.df = df
+        self.sequence_length = sequence_length
+        self.prediction_horizon = prediction_horizon
+        self.feature_columns = feature_columns or [
+            "Open", "High", "Low", "Close", "Volume", "MA_5", "MA_20", "MA_50",
+            "price_change", "volatility_20", "RSI", "volume_ma_20"
+        ]
+        self.sequences = []
+        self.targets = []
+        self._prepare_data()
+
+    def _prepare_data(self):
+        # Pre-allocate arrays for better performance
+        total_sequences = 0
+        for symbol, group in self.df.groupby('Symbol'):
+            group = group.sort_values('time_idx')
+            total_sequences += max(0, len(group) - self.sequence_length - self.prediction_horizon + 1)
+
+        # Pre-allocate arrays
+        self.sequences = np.zeros((total_sequences, self.sequence_length, len(self.feature_columns)), dtype=np.float32)
+        self.targets = np.zeros(total_sequences, dtype=np.float32)
+
+        idx = 0
+        for symbol, group in self.df.groupby('Symbol'):
+            group = group.sort_values('time_idx')
+            values = group[self.feature_columns].values.astype(np.float32)
+            targets = group['future_close_scaled'].values.astype(np.float32)
+
+            for i in range(len(group) - self.sequence_length - self.prediction_horizon + 1):
+                self.sequences[idx] = values[i:i + self.sequence_length]
+                self.targets[idx] = targets[i + self.sequence_length]
+                idx += 1
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq = torch.from_numpy(self.sequences[idx]).float()
+        target = torch.tensor(self.targets[idx]).float()
+        return seq, target
 
 
 def signal_handler(signal, frame):
-    """Handle interrupt signal gracefully"""
     print("\n⏹️  Training interrupted by user. Saving best model...")
-    # Set the interrupted flag to be handled in the training step
     sys.exit(0)
 
 
+def analyze_data_quality(df, dataset_name):
+    """Analyze data quality before training"""
+    print(f"\n📊 {dataset_name} DATA QUALITY ANALYSIS:")
+    print(f"Samples: {len(df):,}")
+    print(f"Symbols: {len(df['Symbol'].unique())}")
+    print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+
+    # Check for NaN values
+    nan_counts = df.isna().sum()
+    if nan_counts.any():
+        print("⚠️  NaN values found:")
+        for col, count in nan_counts.items():
+            if count > 0:
+                print(f"   {col}: {count} NaN values")
+
+    # Check target distribution
+    print(f"Target (future_close) stats:")
+    print(f"   Mean: {df['future_close'].mean():.4f}")
+    print(f"   Std: {df['future_close'].std():.4f}")
+    print(f"   Min: {df['future_close'].min():.4f}")
+    print(f"   Max: {df['future_close'].max():.4f}")
+
+    return df.dropna()
+
+
 def main():
-    """Main function to execute the TFT model training pipeline."""
-
-    # Set up signal handler for graceful interruption
     signal.signal(signal.SIGINT, signal_handler)
-
     start_time = time.time()
 
-    # Create checkpoint directory
+    # Create directories
     os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('models', exist_ok=True)
 
     print("=" * 60)
-    print("TRAINING TFT MODEL FOR STOCK PRICE PREDICTION")
+    print("TRAINING TRANSFORMER MODEL FOR STOCK PRICE PREDICTION")
     print("=" * 60)
-    print("Target validation loss: 75.0")
-    print("Training on CPU for stability")
-    print("Estimated time: 8-15 hours")
+    print(f"Device: {device}")
+    print("Target validation loss: 10.0")
+    print("Using custom Transformer architecture with M1 GPU acceleration")
     print("=" * 60)
 
-    # 1. SETUP AND DATA LOADING
+    # Load and preprocess data
     print("Loading and preprocessing data...")
 
-    # Load training and validation data from Processed_Data folder
     train_df = pd.read_csv('Processed_Data/train_data.csv')
     val_df = pd.read_csv('Processed_Data/val_data.csv')
 
-    # Filter out 'UNKNOWN' symbol from both datasets
+    # Filter data
     train_df = train_df[train_df['Symbol'] != 'UNKNOWN']
     val_df = val_df[val_df['Symbol'] != 'UNKNOWN']
 
-    # Reset indices after filtering
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-
-    # 2. CHECK DATA QUALITY AND TIME CONSISTENCY
-    print("Checking data quality and time consistency...")
-
-    print(f"NaN values in train: {train_df.isna().sum().sum()}")
-    print(f"NaN values in val: {val_df.isna().sum().sum()}")
-
-    # Convert Date column to datetime
+    # Convert dates and create time index
     train_df['Date'] = pd.to_datetime(train_df['Date'])
     val_df['Date'] = pd.to_datetime(val_df['Date'])
-
-    # Check time ranges
-    print(f"Train date range: {train_df['Date'].min()} to {train_df['Date'].max()}")
-    print(f"Validation date range: {val_df['Date'].min()} to {val_df['Date'].max()}")
-
-    # Create consistent time index across both datasets
     min_date = min(train_df['Date'].min(), val_df['Date'].min())
     train_df['time_idx'] = (train_df['Date'] - min_date).dt.days
     val_df['time_idx'] = (val_df['Date'] - min_date).dt.days
 
-    print(f"Train time_idx range: {train_df['time_idx'].min()} to {train_df['time_idx'].max()}")
-    print(f"Validation time_idx range: {val_df['time_idx'].min()} to {val_df['time_idx'].max()}")
-
-    # 3. FILTER DATA PROPERLY
-    # Filter validation data to only include symbols present in training data
+    # Filter symbols
     valid_symbols = set(train_df['Symbol'].unique())
     val_df = val_df[val_df['Symbol'].isin(valid_symbols)]
 
-    # Filter sectors
-    train_sectors = set(train_df['Sector'].unique())
-    val_sectors = set(val_df['Sector'].unique())
-    valid_sectors = train_sectors.intersection(val_sectors)
-    train_df = train_df[train_df['Sector'].isin(valid_sectors)]
-    val_df = val_df[val_df['Sector'].isin(valid_sectors)]
+    # Analyze data quality
+    train_df = analyze_data_quality(train_df, "TRAINING")
+    val_df = analyze_data_quality(val_df, "VALIDATION")
 
-    # Reset indices again after additional filtering
+    # Reset indices
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
 
-    print(f"Train samples after filtering: {len(train_df):,}")
-    print(f"Validation samples after filtering: {len(val_df):,}")
+    print(f"Train samples after cleaning: {len(train_df):,}")
+    print(f"Validation samples after cleaning: {len(val_df):,}")
 
-    # Check target statistics after filtering
-    print(f"Target stats - Train: mean={train_df['future_close'].mean():.2f}, std={train_df['future_close'].std():.2f}")
-    print(f"Target stats - Val: mean={val_df['future_close'].mean():.2f}, std={val_df['future_close'].std():.2f}")
-
-    mean_diff = abs(train_df['future_close'].mean() - val_df['future_close'].mean())
-    if mean_diff > 500:
-        print(f"⚠️  WARNING: Large difference between train and validation target means: {mean_diff:.2f}")
-        print("This suggests different market conditions or data leakage")
-
-    # 4. CATEGORICAL VARIABLES
-    print("Processing categorical variables...")
-
-    all_symbols = pd.concat([train_df['Symbol'], val_df['Symbol']]).unique()
-    all_sectors = pd.concat([train_df['Sector'], val_df['Sector']]).unique()
-
-    train_df['Symbol'] = pd.Categorical(train_df['Symbol'], categories=all_symbols)
-    val_df['Symbol'] = pd.Categorical(val_df['Symbol'], categories=all_symbols)
-    train_df['Sector'] = pd.Categorical(train_df['Sector'], categories=all_sectors)
-    val_df['Sector'] = pd.Categorical(val_df['Sector'], categories=all_sectors)
-
-    # 5. TIMESERIESDATASET CONFIGURATION
-    print("Creating TimeSeriesDataSet objects...")
-
-    # Use essential features only for stability
-    basic_features = [
-        "Open", "High", "Low", "Close", "Volume", "MA_5", "MA_20", "MA_50",
-        "price_change", "volatility_20", "RSI", "volume_ma_20"
+    # Feature columns
+    feature_columns = [
+        "Open", "High", "Low", "Close", "Volume",
+        "MA_5", "MA_20", "MA_50", "price_change", "RSI"
     ]
 
-    existing_columns = [col for col in basic_features if col in train_df.columns]
+    # Save feature list
+    print(f"✅ Saving the feature list ({len(feature_columns)} features) to model_features.pkl...")
+    with open('model_features.pkl', 'wb') as f:
+        pickle.dump(feature_columns, f)
 
-    # Create training dataset with safe settings
-    training = TimeSeriesDataSet(
+    # Scale features
+    print("Scaling features...")
+    scaler = StandardScaler()
+    train_df[feature_columns] = scaler.fit_transform(train_df[feature_columns])
+    val_df[feature_columns] = scaler.transform(val_df[feature_columns])
+
+    # Scale target
+    target_scaler = StandardScaler()
+    train_df['future_close_scaled'] = target_scaler.fit_transform(train_df[['future_close']])
+    val_df['future_close_scaled'] = target_scaler.transform(val_df[['future_close']])
+
+    # Create datasets
+    print("Creating datasets...")
+    train_dataset = StockDataset(
         train_df,
-        time_idx="time_idx",
-        target="future_close",
-        group_ids=["Symbol"],
-        max_encoder_length=60,  # Increased for better context
-        max_prediction_length=7,
-        static_categoricals=["Sector"],
-        time_varying_known_reals=[],
-        time_varying_unknown_reals=existing_columns,
-        target_normalizer=GroupNormalizer(
-            groups=["Symbol"],
-            transformation="softplus",
-            center=True,
-            scale_by_group=True
-        ),
-        add_relative_time_idx=True,
-        add_target_scales=True,
-        allow_missing_timesteps=True,
-        min_encoder_length=20,
+        sequence_length=60,
+        prediction_horizon=1,
+        feature_columns=feature_columns
+    )
+    val_dataset = StockDataset(
+        val_df,
+        sequence_length=60,
+        prediction_horizon=1,
+        feature_columns=feature_columns
     )
 
-    # Create validation dataset
-    validation = TimeSeriesDataSet.from_dataset(
-        training, val_df, predict=False, stop_randomization=True
+    print(f"Train sequences: {len(train_dataset):,}")
+    print(f"Validation sequences: {len(val_dataset):,}")
+
+    # Create dataloaders with optimized settings for MPS
+    batch_size = 128  # Increased batch size for GPU
+    num_workers = 0  # MPS doesn't support multiple workers well
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True  # Faster data transfer to GPU
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True
     )
 
-    # 6. DATALOADERS - Use single worker to avoid multiprocessing issues
-    print("Creating DataLoaders...")
-
-    batch_size = 32  # Reduced batch size for stability
-    train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
-    val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
-
-    # 7. MODEL SETUP
-    tft = TemporalFusionTransformer.from_dataset(
-        training,
-        learning_rate=0.001,
-        hidden_size=128,  # Increased for better capacity
-        attention_head_size=4,
-        dropout=0.3,  # Slightly more regularization
-        loss=QuantileLoss(),
-        log_interval=100,
-        reduce_on_plateau_patience=4,
-        output_size=7,
+    # Create model
+    input_dim = len(feature_columns)
+    model = StockTransformer(
+        input_dim=input_dim,
+        hidden_dim=128,
+        num_layers=2,
+        num_heads=4,
+        dropout=0.3,
+        learning_rate=0.0005
     )
 
-    lightning_tft = TFTLightningWrapper(tft)
+    # Move model to device
+    model.to(device)
 
-    # 8. CALLBACKS
-    early_stop_callback = EarlyStopping(
+    # Callbacks
+    early_stop = EarlyStopping(
         monitor="val_loss",
-        min_delta=0.05,  # Smaller minimum improvement
-        patience=15,  # More patient early stopping
+        patience=15,
+        mode="min",
         verbose=True,
-        mode="min"
+        min_delta=0.001
     )
-
-    checkpoint_callback = ModelCheckpoint(
+    checkpoint = ModelCheckpoint(
         dirpath='checkpoints',
-        filename='tft-best-{epoch:03d}-{val_loss:.2f}',
-        save_top_k=3,
+        filename='transformer-best-{epoch:03d}-{val_loss:.4f}',
+        save_top_k=1,
         monitor='val_loss',
-        mode='min',
-        every_n_epochs=1,
-        save_last=True
+        mode='min'
+    )
+    lr_monitor = LearningRateMonitor()
+
+    # Trainer configuration for MPS
+    trainer = pl.Trainer(
+        max_epochs=50,
+        callbacks=[early_stop, checkpoint, lr_monitor],
+        accelerator='mps' if torch.backends.mps.is_available() else 'cpu',
+        devices=1,
+        log_every_n_steps=10,
+        check_val_every_n_epoch=1,
+        gradient_clip_val=1.0,
+        enable_progress_bar=True,
+        precision='32',  # MPS works best with float32
+        deterministic=True,
     )
 
-    lr_logger = LearningRateMonitor()
-
-    # Custom progress bar with detailed information
-    class DetailedProgressBar(TQDMProgressBar):
-        def __init__(self):
-            super().__init__()
-            self.enable = True
-
-        def on_train_epoch_start(self, trainer, pl_module):
-            super().on_train_epoch_start(trainer, pl_module)
-            if trainer.current_epoch == 0:
-                print(f"\n🚀 Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("⏰ Estimated training time: 8-15 hours")
-                print("🎯 Target validation loss: 75.0")
-                print("💻 Training on CPU for maximum stability")
-                print("📊 Training until validation loss stops improving")
-                print("=" * 60)
-
-    progress_bar = DetailedProgressBar()
-
-    # 9. TRAINER SETUP - FORCE CPU FOR STABILITY
-    trainer_args = {
-        'max_epochs': 200,
-        'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
-        'enable_progress_bar': True,
-        'num_sanity_val_steps': 0,  # Disable sanity check to avoid issues
-        'check_val_every_n_epoch': 1,
-        'gradient_clip_val': 0.5,
-        'accelerator': 'cpu',  # Force CPU for stability
-        'devices': 1,
-        'log_every_n_steps': 25,
-    }
-
-    trainer = pl.Trainer(**trainer_args)
-
-    # 10. TRAINING
-    print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")
-    print(f"Using device: {trainer_args['accelerator']}")
-    print("Starting training...")
+    # Train
+    print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print("Starting training with M1 GPU acceleration...")
 
     try:
-        trainer.fit(
-            lightning_tft,
-            train_dataloaders=train_dataloader,
-            val_dataloaders=val_dataloader,
-        )
+        trainer.fit(model, train_loader, val_loader)
 
-        # 11. SAVE FINAL MODEL
-        print("Saving best model...")
-
-        # Load the best model from checkpoint
-        best_model_path = trainer.checkpoint_callback.best_model_path
+        # Load best model
+        best_model_path = checkpoint.best_model_path
         if best_model_path:
-            best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
-        else:
-            best_tft = lightning_tft.tft
+            print(f"Loading best model from: {best_model_path}")
+            model = StockTransformer.load_from_checkpoint(best_model_path)
+            model.to(device)
 
-        # Save model using torch.save
+        # Save models
         torch.save({
-            'model_state_dict': best_tft.state_dict(),
-            'training_dataset_parameters': training.get_parameters(),
-            'best_val_loss': lightning_tft.best_val_loss,
-        }, 'tft_model.pt')
+            'model_state_dict': model.state_dict(),
+            'feature_scaler': scaler,
+            'target_scaler': target_scaler,
+            'feature_columns': feature_columns,
+            'best_val_loss': trainer.callback_metrics.get('val_loss', float('inf')).item()
+        }, 'models/transformer_best_model.pt')
 
-        print(f"✅ Model saved as 'tft_model.pt'")
-        print(f"🏆 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
+        best_val_loss = trainer.callback_metrics.get('val_loss', float('inf')).item()
+        print(f"✅ Best model saved with validation loss: {best_val_loss:.4f}")
 
     except KeyboardInterrupt:
-        print("\n⏹️  Training interrupted by user. Saving best model...")
-        lightning_tft._save_best_model()
+        print("\n⏹️  Training interrupted. Saving current model...")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'feature_scaler': scaler,
+            'target_scaler': target_scaler,
+            'feature_columns': feature_columns
+        }, 'models/transformer_interrupted.pt')
+        print("💾 Model saved")
 
     except Exception as e:
-        print(f"❌ Training failed with error: {str(e)}")
-        print("💾 Saving current model state for debugging...")
-        torch.save({
-            'model_state_dict': lightning_tft.tft.state_dict(),
-            'training_dataset_parameters': training.get_parameters(),
-        }, 'tft_model_error.pt')
-        print("🔧 Debug model saved as 'tft_model_error.pt'")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'feature_scaler': scaler,
+            'target_scaler': target_scaler
+        }, 'models/transformer_error.pt')
+        print("🔧 Error model saved")
 
-    # 12. FINAL OUTPUT
+    # Final output
     training_time = time.time() - start_time
-    hours, rem = divmod(training_time, 3600)
-    minutes, seconds = divmod(rem, 60)
+    hours, minutes, seconds = int(training_time // 3600), int((training_time % 3600) // 60), int(training_time % 60)
 
     print("=" * 60)
     print("🏁 TRAINING COMPLETE")
     print("=" * 60)
-    print(f"⏱️  Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
+    print(f"⏱️  Time: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
-    if hasattr(lightning_tft, 'best_val_loss'):
-        print(f"📊 Best validation loss: {lightning_tft.best_val_loss:.4f}")
+    best_val_loss = trainer.callback_metrics.get('val_loss', float('inf')).item()
+    print(f"📊 Best validation loss: {best_val_loss:.4f}")
 
-        if lightning_tft.best_val_loss <= 75.0:
-            print("🎯 TARGET ACHIEVED! Validation loss <= 75.0")
-        else:
-            print(f"📉 Target not reached. Best was: {lightning_tft.best_val_loss:.4f}")
+    if best_val_loss <= 10.0:
+        print("🎯 TARGET ACHIEVED!")
+    else:
+        print("📉 Target not reached")
 
     print("=" * 60)
 

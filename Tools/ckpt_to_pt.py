@@ -1,133 +1,111 @@
 import torch
 import os
-import warnings
-import pandas as pd
-from pytorch_forecasting import TemporalFusionTransformer, TimeSeriesDataSet
-from typing import Dict, Any
-
-warnings.filterwarnings('ignore')
+from pathlib import Path
+import argparse
 
 
-def convert_tft_ckpt_to_pt_final(ckpt_path: str, output_path: str, train_csv_path: str):
+def convert_ckpt_to_pt():
     """
-    Directly converts a TFT checkpoint by building a model shell that
-    precisely matches the architecture found in the checkpoint's error logs.
+    Convert PyTorch Lightning CKPT to PT format
     """
-    print("=" * 60)
-    print(f"🚀 Starting Direct Conversion for: {os.path.basename(ckpt_path)}")
-    print("=" * 60)
+    # Define paths
+    checkpoints_dir = Path("../checkpoints")
+    models_dir = Path("../models")
 
-    try:
-        # --- Step 1: Load Checkpoint Weights ---
-        print("📦 Loading checkpoint weights manually...")
-        checkpoint = torch.load(ckpt_path, map_location=torch.device('cpu'))
-        state_dict = checkpoint.get('state_dict')
-        if not state_dict:
-            raise RuntimeError("Checkpoint does not contain 'state_dict'.")
-        # Clean the "tft." prefix from all weight names
-        cleaned_state_dict = {key.replace("tft.", ""): value for key, value in state_dict.items()}
-        print("✅ Weights loaded and cleaned successfully.")
+    # Create models directory if it doesn't exist
+    models_dir.mkdir(exist_ok=True)
 
-        # --- Step 2: Define the EXACT architecture based on forensic analysis of error logs ---
-        # This is the ground truth of your trained model's architecture.
-        print("\n🔧 Defining the exact model architecture...")
+    # Find all .ckpt files
+    ckpt_files = list(checkpoints_dir.glob("*.ckpt"))
 
-        # --- Parameters Inferred from Error Logs ---
-        HIDDEN_SIZE = 64
-        ATTENTION_HEAD_SIZE = 8
-        MAX_PREDICTION_LENGTH = 7
-        STATIC_CATEGORICALS = ["Sector"]
-        TIME_VARYING_REALS = [
-            'Open', 'High', 'Low', 'Close', 'Volume', 'MA_5', 'MA_20', 'MA_50',
-            'price_change', 'volatility_20', 'RSI', 'volume_ma_20'
-        ]
+    if not ckpt_files:
+        print(f"No .ckpt files found in {checkpoints_dir}")
+        return
 
-        # --- Step 3: Recreate the TimeSeriesDataSet blueprint ---
-        print("\n🧬 Rebuilding TimeSeriesDataSet blueprint...")
-        train_df = pd.read_csv(train_csv_path)
-        train_df['Date'] = pd.to_datetime(train_df['Date'])
-        train_df['time_idx'] = (train_df['Date'] - train_df['Date'].min()).dt.days
+    for ckpt_file in ckpt_files:
+        try:
+            print(f"Converting {ckpt_file.name}...")
 
-        reconstructed_dataset = TimeSeriesDataSet(
-            train_df,
-            time_idx="time_idx",
-            target="future_close",
-            group_ids=["Symbol"],
-            max_encoder_length=60,
-            max_prediction_length=MAX_PREDICTION_LENGTH,
-            allow_missing_timesteps=True,
-            static_categoricals=STATIC_CATEGORICALS,
-            time_varying_unknown_reals=TIME_VARYING_REALS,
-            # CRITICAL FIX: Disable automatic features that cause mismatches
-            add_relative_time_idx=False,
-            add_encoder_length=False,
-            add_target_scales=False,
-        )
-        print("✅ Blueprint rebuilt successfully.")
+            # Load checkpoint
+            checkpoint = torch.load(ckpt_file, map_location='cpu')
 
-        # --- Step 4: Build Model from Blueprint ---
-        print("\n🏗️  Building model shell from blueprint...")
-        tft_model = TemporalFusionTransformer.from_dataset(
-            reconstructed_dataset,
-            hidden_size=HIDDEN_SIZE,
-            attention_head_size=ATTENTION_HEAD_SIZE,
-            dropout=0.2,
-            loss=None
-        )
-        print("✅ Model shell created successfully.")
+            # Extract state dict and clean keys
+            state_dict = checkpoint['state_dict']
+            cleaned_state_dict = {}
 
-        # --- Step 5: Load Weights into Model Shell ---
-        print("\n⚖️  Loading weights into the model shell...")
-        # Use strict=False to ignore internal components that are not part of the core model weights
-        tft_model.load_state_dict(cleaned_state_dict, strict=False)
-        tft_model.eval()
-        print("✅ Weights successfully loaded.")
+            for key, value in state_dict.items():
+                # Remove 'model.' prefix if it exists (common in Lightning checkpoints)
+                if key.startswith('model.'):
+                    cleaned_key = key[6:]  # Remove 'model.' prefix
+                else:
+                    cleaned_key = key
+                cleaned_state_dict[cleaned_key] = value
 
-        # --- Step 6: Save the Final Package ---
-        save_package = {
-            'model_state_dict': tft_model.state_dict(),
-            'dataset_parameters': reconstructed_dataset.get_parameters(),
-        }
+            # Extract hyperparameters
+            hyperparameters = checkpoint.get('hyper_parameters', {})
 
-        torch.save(save_package, output_path)
-        print(f"\n💾 Model saved successfully to: '{output_path}'")
-        return output_path
+            # Create output filename
+            output_filename = ckpt_file.stem + ".pt"
+            output_path = models_dir / output_filename
 
-    except Exception as e:
-        print(f"\n❌ A critical error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+            # Save as .pt format
+            torch.save({
+                'state_dict': cleaned_state_dict,
+                'hyperparameters': hyperparameters,
+                'epoch': checkpoint.get('epoch', 0),
+                'global_step': checkpoint.get('global_step', 0),
+                'original_file': ckpt_file.name
+            }, output_path)
+
+            print(f"✓ Successfully converted to: {output_path}")
+            print(f"  - Parameters: {len(cleaned_state_dict)}")
+            print(f"  - Epoch: {checkpoint.get('epoch', 'N/A')}")
+            print(f"  - Hyperparameters: {list(hyperparameters.keys())}")
+            print()
+
+        except Exception as e:
+            print(f"✗ Failed to convert {ckpt_file.name}: {str(e)}")
+            print()
 
 
-def verify_tft_conversion(pt_path: str):
-    """Verifies that the new .pt file can be used to load the TFT model."""
-    print("-" * 60)
-    print(f"🔍 Verifying converted file: {os.path.basename(pt_path)}...")
-    try:
-        package = torch.load(pt_path, map_location=torch.device('cpu'))
-        model = TemporalFusionTransformer.from_parameters(package['dataset_parameters'])
-        model.load_state_dict(package['model_state_dict'])
-        model.eval()
-        print("\n✅ VERIFICATION SUCCESSFUL!")
-        print("   The .pt file can be used to fully reconstruct the trained TFT model.")
-    except Exception as e:
-        print(f"\n❌ VERIFICATION FAILED. Error: {e}")
+def verify_conversion():
+    """
+    Verify the converted .pt files
+    """
+    models_dir = Path("../models")
+    pt_files = list(models_dir.glob("*.pt"))
+
+    if not pt_files:
+        print("No .pt files found for verification")
+        return
+
+    print("Verifying converted files...")
+    print("=" * 50)
+
+    for pt_file in pt_files:
+        try:
+            model_data = torch.load(pt_file, map_location='cpu')
+            print(f"✓ {pt_file.name}:")
+            print(f"  - Keys: {list(model_data.keys())}")
+            print(f"  - Parameters: {len(model_data['state_dict'])}")
+            print(f"  - Epoch: {model_data.get('epoch', 'N/A')}")
+            print()
+
+        except Exception as e:
+            print(f"✗ Failed to verify {pt_file.name}: {str(e)}")
+            print()
 
 
-# --- Main Execution Block ---
 if __name__ == "__main__":
-    ckpt_file_path = "/Users/BiTS/PycharmProjects/BiTSDissertation/checkpoints/tft-best-epoch=009-val_loss=107.95.ckpt"
-    training_data_path = "/Users/BiTS/PycharmProjects/BiTSDissertation/Processed_Data/train_data.csv"
-    output_pt_path = "/Users/BiTS/PycharmProjects/BiTSDissertation/outputModel/converted_tft_model.pt"
+    # Simple conversion without command line arguments
+    print("Starting CKPT to PT conversion...")
+    print("=" * 50)
 
-    os.makedirs(os.path.dirname(output_pt_path), exist_ok=True)
+    # Convert all checkpoints
+    convert_ckpt_to_pt()
 
-    converted_path = convert_tft_ckpt_to_pt_final(
-        ckpt_path=ckpt_file_path,
-        output_path=output_pt_path,
-        train_csv_path=training_data_path
-    )
+    # Verify the conversion
+    print("=" * 50)
+    verify_conversion()
 
-    if converted_path:
-        verify_tft_conversion(pt_path=converted_path)
+    print("Conversion process completed!")

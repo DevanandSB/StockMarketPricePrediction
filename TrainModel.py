@@ -1,136 +1,128 @@
 #!/usr/bin/env python3
 """
-TrainModel.py - Transformer for Stock Price Prediction with M1 GPU Support
-
-This script trains a Transformer model to predict future closing prices of multiple stocks.
-Optimized for Apple M1 GPU acceleration.
-
-Author: Devanand S B
-Date: 2025
+COMPLETE Stock Prediction Transformer - With All Features & Fixed Data
 """
 
 import pandas as pd
 import torch
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, TQDMProgressBar, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 import pickle
 import time
 import warnings
 import os
 import signal
 import sys
-from pathlib import Path
 import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import math
-from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 warnings.filterwarnings('ignore')
 
-# Set device for M1 GPU acceleration
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-    print(f"✅ Using Apple M1 GPU (Metal)")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-    print(f"✅ Using CUDA GPU")
-else:
-    device = torch.device("cpu")
-    print(f"⚠️  Using CPU (no GPU available)")
+# Set device
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+print(f"🚀 Using device: {device}")
 
 
-# Custom Transformer Model
-class StockTransformer(pl.LightningModule):
-    def __init__(self, input_dim, hidden_dim=256, num_layers=4, num_heads=8, dropout=0.1, learning_rate=0.001):
+def signal_handler(signal, frame):
+    print("\n⏹️  Training interrupted. Saving model...")
+    sys.exit(0)
+
+
+def create_time_based_split(df, train_ratio=0.8):
+    """Create proper time-based split for each symbol"""
+    df = df.sort_values(['Symbol', 'Date'])
+
+    train_dfs, val_dfs = [], []
+
+    for symbol, symbol_data in df.groupby('Symbol'):
+        symbol_data = symbol_data.sort_values('Date')
+        split_idx = int(len(symbol_data) * train_ratio)
+
+        train_dfs.append(symbol_data.iloc[:split_idx])
+        val_dfs.append(symbol_data.iloc[split_idx:])
+
+    train_df = pd.concat(train_dfs).reset_index(drop=True)
+    val_df = pd.concat(val_dfs).reset_index(drop=True)
+
+    return train_df, val_df
+
+
+# ENHANCED TRANSFORMER WITH ALL FEATURES
+class CompleteTransformer(pl.LightningModule):
+    def __init__(self, input_dim, hidden_dim=128, num_layers=2, num_heads=4, dropout=0.2, learning_rate=0.0003):
         super().__init__()
         self.save_hyperparameters()
 
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.learning_rate = learning_rate
-
         # Input projection
-        self.input_projection = nn.Linear(input_dim, hidden_dim)
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        self.input_dropout = nn.Dropout(dropout)
 
         # Positional encoding
         self.pos_encoder = PositionalEncoding(hidden_dim, dropout)
 
         # Transformer layers
-        encoder_layers = nn.TransformerEncoderLayer(
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
+            dim_feedforward=hidden_dim * 2,
             dropout=dropout,
             batch_first=True,
-            activation='gelu'  # Better for MPS
+            activation='relu'
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
 
-        # Output layers - predict only 1 value (next day's close)
-        self.output_projection = nn.Linear(hidden_dim, 64)
-        self.output_layer = nn.Linear(64, 1)
+        # Output layers
+        self.output = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
 
         self.loss_fn = nn.MSELoss()
-        self.best_val_loss = float('inf')
 
-    def forward(self, x, mask=None):
-        # x shape: [batch_size, seq_len, input_dim]
-        x = self.input_projection(x)
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.input_dropout(x)
         x = self.pos_encoder(x)
-
-        # Transformer expects [seq_len, batch_size, dim] for mask, but we use batch_first=True
-        if mask is not None:
-            mask = mask.transpose(0, 1)  # Convert to [seq_len, seq_len]
-
-        x = self.transformer_encoder(x, mask=mask)
-
-        # Use the last time step's output for prediction
-        x = x[:, -1, :]  # Take the last time step
-
-        x = torch.nn.functional.gelu(self.output_projection(x))
-        x = self.output_layer(x)
-        return x
+        x = self.transformer(x)
+        x = x[:, -1, :]  # Last time step
+        return self.output(x)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        predictions = self(x)
-        loss = self.loss_fn(predictions, y)
-        self.log('train_loss', loss, prog_bar=True, sync_dist=True)
+        y_pred = self(x)
+        loss = self.loss_fn(y_pred, y)
+        self.log('train_loss', loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        predictions = self(x)
-        loss = self.loss_fn(predictions, y)
-        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
-        self.log('val_rmse', torch.sqrt(loss), prog_bar=True, sync_dist=True)
+        y_pred = self(x)
+        loss = self.loss_fn(y_pred, y)
+        self.log('val_loss', loss, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        optimizer = optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-5)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+        optimizer = optim.Adam(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            weight_decay=1e-5
         )
-        return {
-            'optimizer': optimizer,
-            'lr_scheduler': {
-                'scheduler': scheduler,
-                'monitor': 'val_loss',
-                'interval': 'epoch',
-                'frequency': 1,
-            }
-        }
+        return optimizer
 
 
 # Positional Encoding
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncoding, self).__init__()
+        super().__init__()
         self.dropout = nn.Dropout(p=dropout)
-
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
@@ -144,281 +136,179 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-# Custom Dataset - Optimized for GPU
+# DATASET
 class StockDataset(Dataset):
-    def __init__(self, df, sequence_length=60, prediction_horizon=1, feature_columns=None):
+    def __init__(self, df, sequence_length=20, feature_columns=None):
         self.df = df
-        self.sequence_length = sequence_length
-        self.prediction_horizon = prediction_horizon
-        self.feature_columns = feature_columns or [
-            "Open", "High", "Low", "Close", "Volume", "MA_5", "MA_20", "MA_50",
-            "price_change", "volatility_20", "RSI", "volume_ma_20"
-        ]
-        self.sequences = []
-        self.targets = []
-        self._prepare_data()
+        self.seq_len = sequence_length
+        self.feature_columns = feature_columns
+        self.sequences, self.targets = self._prepare_data()
 
     def _prepare_data(self):
-        # Pre-allocate arrays for better performance
-        total_sequences = 0
-        for symbol, group in self.df.groupby('Symbol'):
-            group = group.sort_values('time_idx')
-            total_sequences += max(0, len(group) - self.sequence_length - self.prediction_horizon + 1)
+        sequences = []
+        targets = []
 
-        # Pre-allocate arrays
-        self.sequences = np.zeros((total_sequences, self.sequence_length, len(self.feature_columns)), dtype=np.float32)
-        self.targets = np.zeros(total_sequences, dtype=np.float32)
-
-        idx = 0
         for symbol, group in self.df.groupby('Symbol'):
-            group = group.sort_values('time_idx')
+            group = group.sort_values('Date')
+
             values = group[self.feature_columns].values.astype(np.float32)
-            targets = group['future_close_scaled'].values.astype(np.float32)
+            future_closes = group['future_close_scaled'].values.astype(np.float32)
 
-            for i in range(len(group) - self.sequence_length - self.prediction_horizon + 1):
-                self.sequences[idx] = values[i:i + self.sequence_length]
-                self.targets[idx] = targets[i + self.sequence_length]
-                idx += 1
+            for i in range(len(group) - self.seq_len - 1):
+                seq = values[i:i + self.seq_len]
+                target = future_closes[i + self.seq_len]
+
+                sequences.append(seq)
+                targets.append(target)
+
+        return np.array(sequences, dtype=np.float32), np.array(targets, dtype=np.float32)
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, idx):
-        seq = torch.from_numpy(self.sequences[idx]).float()
-        target = torch.tensor(self.targets[idx]).float()
-        return seq, target
+        return (
+            torch.FloatTensor(self.sequences[idx]),
+            torch.FloatTensor([self.targets[idx]])
+        )
 
 
-def signal_handler(signal, frame):
-    print("\n⏹️  Training interrupted by user. Saving best model...")
-    sys.exit(0)
+def prepare_data():
+    """Prepare data with proper time-based split and ALL features"""
+    print("📊 Loading data with proper time-based split...")
 
+    # Load all data and split properly
+    all_data = pd.read_csv('Processed_Data/train_data.csv')
+    all_data = pd.concat([all_data, pd.read_csv('Processed_Data/val_data.csv')])
+    all_data = all_data[all_data['Symbol'] != 'UNKNOWN'].copy()
+    all_data['Date'] = pd.to_datetime(all_data['Date'])
 
-def analyze_data_quality(df, dataset_name):
-    """Analyze data quality before training"""
-    print(f"\n📊 {dataset_name} DATA QUALITY ANALYSIS:")
-    print(f"Samples: {len(df):,}")
-    print(f"Symbols: {len(df['Symbol'].unique())}")
-    print(f"Date range: {df['Date'].min()} to {df['Date'].max()}")
+    # Create proper time-based split
+    train_df, val_df = create_time_based_split(all_data, train_ratio=0.8)
 
-    # Check for NaN values
-    nan_counts = df.isna().sum()
-    if nan_counts.any():
-        print("⚠️  NaN values found:")
-        for col, count in nan_counts.items():
-            if count > 0:
-                print(f"   {col}: {count} NaN values")
+    print(f"✅ Proper split - Train: {len(train_df):,}, Val: {len(val_df):,}")
 
-    # Check target distribution
-    print(f"Target (future_close) stats:")
-    print(f"   Mean: {df['future_close'].mean():.4f}")
-    print(f"   Std: {df['future_close'].std():.4f}")
-    print(f"   Min: {df['future_close'].min():.4f}")
-    print(f"   Max: {df['future_close'].max():.4f}")
+    # Get ALL features (technical + fundamental + sentiment)
+    exclude_cols = ['Date', 'Symbol', 'time_idx', 'future_close', 'future_close_scaled']
+    all_features = [col for col in train_df.columns if col not in exclude_cols]
 
-    return df.dropna()
+    # Clean numeric data
+    for col in all_features:
+        train_df[col] = pd.to_numeric(train_df[col], errors='coerce')
+        val_df[col] = pd.to_numeric(val_df[col], errors='coerce')
+
+    # Fill NaN values
+    train_df = train_df.fillna(0)
+    val_df = val_df.fillna(0)
+
+    print(f"✅ Using {len(all_features)} features:")
+    print("   - Technical indicators")
+    print("   - Fundamental analysis")
+    print("   - Sentiment analysis")
+
+    # Scale features
+    scaler = RobustScaler()
+    train_df[all_features] = scaler.fit_transform(train_df[all_features])
+    val_df[all_features] = scaler.transform(val_df[all_features])
+
+    # Scale target
+    target_scaler = RobustScaler()
+    train_df['future_close_scaled'] = target_scaler.fit_transform(train_df[['future_close']])
+    val_df['future_close_scaled'] = target_scaler.transform(val_df[['future_close']])
+
+    return train_df, val_df, all_features, scaler, target_scaler
 
 
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     start_time = time.time()
 
-    # Create directories
     os.makedirs('checkpoints', exist_ok=True)
     os.makedirs('models', exist_ok=True)
 
     print("=" * 60)
-    print("TRAINING TRANSFORMER MODEL FOR STOCK PRICE PREDICTION")
-    print("=" * 60)
-    print(f"Device: {device}")
-    print("Target validation loss: 10.0")
-    print("Using custom Transformer architecture with M1 GPU acceleration")
+    print("🎯 COMPLETE STOCK PREDICTION TRANSFORMER")
+    print("🎯 With Technical + Fundamental + Sentiment Analysis")
     print("=" * 60)
 
-    # Load and preprocess data
-    print("Loading and preprocessing data...")
-
-    train_df = pd.read_csv('Processed_Data/train_data.csv')
-    val_df = pd.read_csv('Processed_Data/val_data.csv')
-
-    # Filter data
-    train_df = train_df[train_df['Symbol'] != 'UNKNOWN']
-    val_df = val_df[val_df['Symbol'] != 'UNKNOWN']
-
-    # Convert dates and create time index
-    train_df['Date'] = pd.to_datetime(train_df['Date'])
-    val_df['Date'] = pd.to_datetime(val_df['Date'])
-    min_date = min(train_df['Date'].min(), val_df['Date'].min())
-    train_df['time_idx'] = (train_df['Date'] - min_date).dt.days
-    val_df['time_idx'] = (val_df['Date'] - min_date).dt.days
-
-    # Filter symbols
-    valid_symbols = set(train_df['Symbol'].unique())
-    val_df = val_df[val_df['Symbol'].isin(valid_symbols)]
-
-    # Analyze data quality
-    train_df = analyze_data_quality(train_df, "TRAINING")
-    val_df = analyze_data_quality(val_df, "VALIDATION")
-
-    # Reset indices
-    train_df = train_df.reset_index(drop=True)
-    val_df = val_df.reset_index(drop=True)
-
-    print(f"Train samples after cleaning: {len(train_df):,}")
-    print(f"Validation samples after cleaning: {len(val_df):,}")
-
-    # Feature columns
-    feature_columns = [
-        "Open", "High", "Low", "Close", "Volume",
-        "MA_5", "MA_20", "MA_50", "price_change", "RSI"
-    ]
-
-    # Save feature list
-    print(f"✅ Saving the feature list ({len(feature_columns)} features) to model_features.pkl...")
-    with open('model_features.pkl', 'wb') as f:
-        pickle.dump(feature_columns, f)
-
-    # Scale features
-    print("Scaling features...")
-    scaler = StandardScaler()
-    train_df[feature_columns] = scaler.fit_transform(train_df[feature_columns])
-    val_df[feature_columns] = scaler.transform(val_df[feature_columns])
-
-    # Scale target
-    target_scaler = StandardScaler()
-    train_df['future_close_scaled'] = target_scaler.fit_transform(train_df[['future_close']])
-    val_df['future_close_scaled'] = target_scaler.transform(val_df[['future_close']])
+    # Prepare data with proper split and ALL features
+    train_df, val_df, all_features, scaler, target_scaler = prepare_data()
 
     # Create datasets
-    print("Creating datasets...")
-    train_dataset = StockDataset(
-        train_df,
-        sequence_length=60,
-        prediction_horizon=1,
-        feature_columns=feature_columns
-    )
-    val_dataset = StockDataset(
-        val_df,
-        sequence_length=60,
-        prediction_horizon=1,
-        feature_columns=feature_columns
-    )
+    train_dataset = StockDataset(train_df, sequence_length=20, feature_columns=all_features)
+    val_dataset = StockDataset(val_df, sequence_length=20, feature_columns=all_features)
 
-    print(f"Train sequences: {len(train_dataset):,}")
-    print(f"Validation sequences: {len(val_dataset):,}")
+    print(f"📊 Sequences - Train: {len(train_dataset):,}, Val: {len(val_dataset):,}")
 
-    # Create dataloaders with optimized settings for MPS
-    batch_size = 128  # Increased batch size for GPU
-    num_workers = 0  # MPS doesn't support multiple workers well
+    # DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=0)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True  # Faster data transfer to GPU
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
-    )
-
-    # Create model
-    input_dim = len(feature_columns)
-    model = StockTransformer(
-        input_dim=input_dim,
+    # Complete model with all features
+    model = CompleteTransformer(
+        input_dim=len(all_features),
         hidden_dim=128,
         num_layers=2,
         num_heads=4,
-        dropout=0.3,
-        learning_rate=0.0005
-    )
-
-    # Move model to device
-    model.to(device)
+        dropout=0.2,
+        learning_rate=0.0003
+    ).to(device)
 
     # Callbacks
-    early_stop = EarlyStopping(
-        monitor="val_loss",
-        patience=15,
-        mode="min",
-        verbose=True,
-        min_delta=0.001
-    )
     checkpoint = ModelCheckpoint(
         dirpath='checkpoints',
-        filename='transformer-best-{epoch:03d}-{val_loss:.4f}',
-        save_top_k=1,
+        filename='complete-model-{epoch}-{val_loss:.4f}',
         monitor='val_loss',
-        mode='min'
+        mode='min',
+        save_top_k=1
     )
-    lr_monitor = LearningRateMonitor()
 
-    # Trainer configuration for MPS
+    early_stop = EarlyStopping(
+        monitor='val_loss',
+        patience=10,
+        mode='min',
+        min_delta=0.001,
+        verbose=True
+    )
+
+    # Trainer
     trainer = pl.Trainer(
-        max_epochs=50,
-        callbacks=[early_stop, checkpoint, lr_monitor],
+        max_epochs=100,
+        callbacks=[early_stop, checkpoint, LearningRateMonitor()],
         accelerator='mps' if torch.backends.mps.is_available() else 'cpu',
         devices=1,
-        log_every_n_steps=10,
-        check_val_every_n_epoch=1,
-        gradient_clip_val=1.0,
-        enable_progress_bar=True,
-        precision='32',  # MPS works best with float32
-        deterministic=True,
+        log_every_n_steps=20,
+        enable_progress_bar=True
     )
 
-    # Train
-    print(f"Number of parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print("Starting training with M1 GPU acceleration...")
+    print(f"🚀 Starting training with {sum(p.numel() for p in model.parameters()):,} parameters")
+    print("=" * 60)
 
     try:
         trainer.fit(model, train_loader, val_loader)
 
-        # Load best model
-        best_model_path = checkpoint.best_model_path
-        if best_model_path:
-            print(f"Loading best model from: {best_model_path}")
-            model = StockTransformer.load_from_checkpoint(best_model_path)
-            model.to(device)
+        if checkpoint.best_model_path:
+            model = CompleteTransformer.load_from_checkpoint(checkpoint.best_model_path)
+            best_val_loss = checkpoint.best_model_score.item() if checkpoint.best_model_score else float('inf')
+            print(f"✅ Best model validation loss: {best_val_loss:.4f}")
 
-        # Save models
+        # Save model
         torch.save({
             'model_state_dict': model.state_dict(),
             'feature_scaler': scaler,
             'target_scaler': target_scaler,
-            'feature_columns': feature_columns,
-            'best_val_loss': trainer.callback_metrics.get('val_loss', float('inf')).item()
-        }, 'models/transformer_best_model.pt')
+            'feature_columns': all_features,
+            'best_val_loss': best_val_loss
+        }, 'models/complete_transformer.pt')
 
-        best_val_loss = trainer.callback_metrics.get('val_loss', float('inf')).item()
-        print(f"✅ Best model saved with validation loss: {best_val_loss:.4f}")
-
-    except KeyboardInterrupt:
-        print("\n⏹️  Training interrupted. Saving current model...")
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'feature_scaler': scaler,
-            'target_scaler': target_scaler,
-            'feature_columns': feature_columns
-        }, 'models/transformer_interrupted.pt')
-        print("💾 Model saved")
+        print("💾 Complete model saved with ALL features")
 
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'feature_scaler': scaler,
-            'target_scaler': target_scaler
-        }, 'models/transformer_error.pt')
-        print("🔧 Error model saved")
 
-    # Final output
+    # RESULTS
     training_time = time.time() - start_time
     hours, minutes, seconds = int(training_time // 3600), int((training_time % 3600) // 60), int(training_time % 60)
 
@@ -427,13 +317,16 @@ def main():
     print("=" * 60)
     print(f"⏱️  Time: {hours:02d}:{minutes:02d}:{seconds:02d}")
 
-    best_val_loss = trainer.callback_metrics.get('val_loss', float('inf')).item()
-    print(f"📊 Best validation loss: {best_val_loss:.4f}")
+    if checkpoint.best_model_score:
+        final_loss = checkpoint.best_model_score.item()
+        print(f"📊 Best validation loss: {final_loss:.4f}")
 
-    if best_val_loss <= 10.0:
-        print("🎯 TARGET ACHIEVED!")
-    else:
-        print("📉 Target not reached")
+        if final_loss < 0.1:
+            print("🎉 EXCELLENT PERFORMANCE! (Loss < 0.1)")
+        elif final_loss < 0.5:
+            print("✅ GOOD PERFORMANCE! (Loss < 0.5)")
+        else:
+            print("⚠️  NEEDS IMPROVEMENT")
 
     print("=" * 60)
 

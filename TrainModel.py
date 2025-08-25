@@ -20,8 +20,7 @@ import pickle
 import time
 import warnings
 import os
-import signal
-import sys
+import traceback
 
 warnings.filterwarnings('ignore')
 
@@ -34,17 +33,11 @@ class TFTLightningWrapper(pl.LightningModule):
         self.loss_fn = QuantileLoss()
         self.best_val_loss = float('inf')
         self.best_model_state = None
-        self.interrupted = False
 
     def forward(self, x):
         return self.tft(x)
 
     def training_step(self, batch, batch_idx):
-        # Check for interruption at each training step
-        if self.interrupted:
-            self._save_best_model()
-            raise KeyboardInterrupt("Training interrupted by user")
-
         x, y_tuple = batch
         y = y_tuple[0]  # Extract the target from the tuple
 
@@ -171,19 +164,31 @@ class TFTLightningWrapper(pl.LightningModule):
             print(f"📈 Best validation loss achieved: {self.best_val_loss:.4f}")
 
 
-def signal_handler(signal, frame):
-    """Handle interrupt signal gracefully"""
-    print("\n⏹️  Training interrupted by user. Saving best model...")
-    # Set the interrupted flag to be handled in the training step
-    sys.exit(0)
+def get_optimal_device():
+    """
+    Determine the best available device with memory optimization.
+    MODIFIED: This function is fixed to avoid the MPS bug by falling back to CPU.
+    """
+    if torch.cuda.is_available():
+        # CUDA GPU available
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3  # GB
+        print(f"CUDA GPU detected: {gpu_name} with {gpu_memory:.1f}GB memory")
+
+        if gpu_memory >= 16:  # High-end GPU (RTX 3080, A100, etc.)
+            return 'cuda', 32, 128, 4, 60
+        elif gpu_memory >= 8:  # Mid-range GPU (RTX 2070, etc.)
+            return 'cuda', 16, 96, 3, 50
+        else:  # Low-end GPU
+            return 'cuda', 8, 64, 2, 40
+
+    else:  # CPU fallback
+        print("No CUDA GPU detected, using CPU. This will be slower.")
+        return 'cpu', 16, 64, 2, 45
 
 
 def main():
     """Main function to execute the TFT model training pipeline."""
-
-    # Set up signal handler for graceful interruption
-    signal.signal(signal.SIGINT, signal_handler)
-
     start_time = time.time()
 
     # Create checkpoint directory
@@ -193,8 +198,7 @@ def main():
     print("TRAINING TFT MODEL FOR STOCK PRICE PREDICTION")
     print("=" * 60)
     print("Target validation loss: 75.0")
-    print("Training on CPU for stability")
-    print("Estimated time: 8-15 hours")
+    print("Auto-detecting optimal hardware configuration...")
     print("=" * 60)
 
     # 1. SETUP AND DATA LOADING
@@ -273,7 +277,18 @@ def main():
     train_df['Sector'] = pd.Categorical(train_df['Sector'], categories=all_sectors)
     val_df['Sector'] = pd.Categorical(val_df['Sector'], categories=all_sectors)
 
-    # 5. TIMESERIESDATASET CONFIGURATION
+    # 5. AUTO-DETECT OPTIMAL HARDWARE CONFIGURATION
+    print("Auto-detecting optimal hardware configuration...")
+    accelerator, batch_size, hidden_size, attention_heads, encoder_length = get_optimal_device()
+
+    print(f"Optimal configuration:")
+    print(f"  - Accelerator: {accelerator}")
+    print(f"  - Batch size: {batch_size}")
+    print(f"  - Hidden size: {hidden_size}")
+    print(f"  - Attention heads: {attention_heads}")
+    print(f"  - Encoder length: {encoder_length}")
+
+    # 6. TIMESERIESDATASET CONFIGURATION
     print("Creating TimeSeriesDataSet objects...")
 
     # Use essential features only for stability
@@ -284,13 +299,13 @@ def main():
 
     existing_columns = [col for col in basic_features if col in train_df.columns]
 
-    # Create training dataset with safe settings
+    # Create training dataset with optimized settings
     training = TimeSeriesDataSet(
         train_df,
         time_idx="time_idx",
         target="future_close",
         group_ids=["Symbol"],
-        max_encoder_length=60,  # Increased for better context
+        max_encoder_length=encoder_length,
         max_prediction_length=7,
         static_categoricals=["Sector"],
         time_varying_known_reals=[],
@@ -304,7 +319,7 @@ def main():
         add_relative_time_idx=True,
         add_target_scales=True,
         allow_missing_timesteps=True,
-        min_encoder_length=20,
+        min_encoder_length=max(10, encoder_length // 3),
     )
 
     # Create validation dataset
@@ -312,20 +327,18 @@ def main():
         training, val_df, predict=False, stop_randomization=True
     )
 
-    # 6. DATALOADERS - Use single worker to avoid multiprocessing issues
+    # 7. DATALOADERS - Use single worker to avoid multiprocessing issues
     print("Creating DataLoaders...")
-
-    batch_size = 32  # Reduced batch size for stability
     train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, num_workers=0)
     val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, num_workers=0)
 
-    # 7. MODEL SETUP
+    # 8. MODEL SETUP - Optimized for detected hardware
     tft = TemporalFusionTransformer.from_dataset(
         training,
         learning_rate=0.001,
-        hidden_size=128,  # Increased for better capacity
-        attention_head_size=4,
-        dropout=0.3,  # Slightly more regularization
+        hidden_size=hidden_size,
+        attention_head_size=attention_heads,
+        dropout=0.2,  # Regularization
         loss=QuantileLoss(),
         log_interval=100,
         reduce_on_plateau_patience=4,
@@ -334,7 +347,7 @@ def main():
 
     lightning_tft = TFTLightningWrapper(tft)
 
-    # 8. CALLBACKS
+    # 9. CALLBACKS
     early_stop_callback = EarlyStopping(
         monitor="val_loss",
         min_delta=0.05,  # Smaller minimum improvement
@@ -363,34 +376,52 @@ def main():
 
         def on_train_epoch_start(self, trainer, pl_module):
             super().on_train_epoch_start(trainer, pl_module)
+            # FIX: The check 'trainer.resumed_from_checkpoint' is removed as it no longer exists.
+            # Checking if the current epoch is 0 is sufficient to know it's a new run.
             if trainer.current_epoch == 0:
                 print(f"\n🚀 Training started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                print("⏰ Estimated training time: 8-15 hours")
+                print(f"⏰ Estimated training time: 4-8 hours")
                 print("🎯 Target validation loss: 75.0")
-                print("💻 Training on CPU for maximum stability")
+                print(f"💻 Training on {accelerator.upper()}")
                 print("📊 Training until validation loss stops improving")
                 print("=" * 60)
 
     progress_bar = DetailedProgressBar()
 
-    # 9. TRAINER SETUP - FORCE CPU FOR STABILITY
+    # 10. TRAINER SETUP - Optimized for detected hardware
     trainer_args = {
         'max_epochs': 200,
         'callbacks': [early_stop_callback, checkpoint_callback, lr_logger, progress_bar],
         'enable_progress_bar': True,
         'num_sanity_val_steps': 0,  # Disable sanity check to avoid issues
         'check_val_every_n_epoch': 1,
-        'gradient_clip_val': 0.5,
-        'accelerator': 'cpu',  # Force CPU for stability
+        'gradient_clip_val': 0.3,
+        'accelerator': accelerator,
         'devices': 1,
         'log_every_n_steps': 25,
     }
 
+    # Set precision based on accelerator
+    if accelerator == 'cuda':
+        trainer_args['precision'] = '16-mixed'  # Mixed precision for CUDA
+    else:
+        trainer_args['precision'] = '32'  # Full precision for MPS/CPU
+
     trainer = pl.Trainer(**trainer_args)
 
-    # 10. TRAINING
+    # 11. TRAINING
     print(f"Number of parameters in network: {tft.size() / 1e3:.1f}k")
-    print(f"Using device: {trainer_args['accelerator']}")
+    print(f"Using device: {accelerator}")
+
+    # ADDED: Check for a checkpoint to resume training
+    ckpt_path = "checkpoints/last.ckpt"
+    if os.path.exists(ckpt_path):
+        print(f"🔄 Found checkpoint. Resuming training from: {ckpt_path}")
+        resume_from_checkpoint = ckpt_path
+    else:
+        print("🚀 No checkpoint found. Starting a new training session.")
+        resume_from_checkpoint = None
+
     print("Starting training...")
 
     try:
@@ -398,16 +429,19 @@ def main():
             lightning_tft,
             train_dataloaders=train_dataloader,
             val_dataloaders=val_dataloader,
+            ckpt_path=resume_from_checkpoint  # This will resume training if a checkpoint is found
         )
 
-        # 11. SAVE FINAL MODEL
+        # 12. SAVE FINAL MODEL
         print("Saving best model...")
 
         # Load the best model from checkpoint
         best_model_path = trainer.checkpoint_callback.best_model_path
-        if best_model_path:
+        if best_model_path and os.path.exists(best_model_path):
+            print(f"Loading best model from: {best_model_path}")
             best_tft = TemporalFusionTransformer.load_from_checkpoint(best_model_path)
         else:
+            print("No best model checkpoint found. Using the last state of the model.")
             best_tft = lightning_tft.tft
 
         # Save model using torch.save
@@ -421,7 +455,7 @@ def main():
         print(f"🏆 Best validation loss achieved: {lightning_tft.best_val_loss:.4f}")
 
     except KeyboardInterrupt:
-        print("\n⏹️  Training interrupted by user. Saving best model...")
+        print("\n⏹️  Training interrupted by user. Saving best model from this session...")
         lightning_tft._save_best_model()
 
     except Exception as e:
@@ -432,10 +466,9 @@ def main():
             'training_dataset_parameters': training.get_parameters(),
         }, 'tft_model_error.pt')
         print("🔧 Debug model saved as 'tft_model_error.pt'")
-        import traceback
         traceback.print_exc()
 
-    # 12. FINAL OUTPUT
+    # 13. FINAL OUTPUT
     training_time = time.time() - start_time
     hours, rem = divmod(training_time, 3600)
     minutes, seconds = divmod(rem, 60)
@@ -445,7 +478,7 @@ def main():
     print("=" * 60)
     print(f"⏱️  Total training time: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}")
 
-    if hasattr(lightning_tft, 'best_val_loss'):
+    if hasattr(lightning_tft, 'best_val_loss') and lightning_tft.best_val_loss != float('inf'):
         print(f"📊 Best validation loss: {lightning_tft.best_val_loss:.4f}")
 
         if lightning_tft.best_val_loss <= 75.0:
